@@ -13,9 +13,11 @@ The installable package name is `lerobot_policy_latent_smolvla`.
 
 - an auxiliary latent head on top of the SmolVLA backbone
 - `training_mode` options: `action`, `latent`, or `multitask`
-- `latent_head_mode` options: `index_cross_entropy` or `vector_diffusion`
-- optional per-sample supervision masks via `latent_supervision_key` and `action_supervision_key`
-- latent target routing through `latent_label_key` with default `latent_labels`
+- `latent_head_mode` options: `index_cross_entropy` or `vector_diffusion` (default)
+- latent target routing through `latent_label_key` with default `latent_labels.continuous_vector_latents`
+- latent target validity through `latent_valid_key` with default `latent_labels.valid`
+- optional per-sample branch routing through `latent_supervision_key` and `action_supervision_key`
+- preservation of configured latent-related and supervision keys through preprocessing via complementary data
 
 ## Install
 
@@ -36,23 +38,32 @@ The tests require `lerobot` to be installed in the active environment.
 
 ## Example Train Command
 
+For mixed-supervision batches, keep `policy.training_mode=multitask` globally and
+route the branches per sample with boolean supervision masks.
+
 ```bash
 lerobot-train \
   --policy.type=latent_smolvla \
   --dataset.repo_id=HuggingFaceVLA/libero \
   --policy.training_mode=multitask \
-  --policy.latent_label_key=latent_labels \
-  --policy.latent_head_mode=index_cross_entropy \
+  --policy.latent_head_mode=vector_diffusion \
+  --policy.latent_label_key=latent_labels.continuous_vector_latents \
+  --policy.latent_valid_key=latent_labels.valid \
+  --policy.latent_supervision_key=latent_supervision \
+  --policy.action_supervision_key=action_supervision \
   --batch_size=8 \
   --steps=200
 ```
 
 ## Important Config Knobs
 
-- `policy.training_mode` controls whether training uses action supervision, latent supervision, or both.
+- `policy.training_mode` is still a run-level switch. Use `multitask` when a batch may contain both action-supervised and latent-supervised samples.
 - `policy.latent_head_mode=index_cross_entropy` expects discrete latent labels.
-- `policy.latent_head_mode=vector_diffusion` expects continuous latent vectors shaped to `latent_vector_dim`.
-- `policy.latent_supervision_key` and `policy.action_supervision_key` can gate losses per sample for mixed-supervision batches.
+- `policy.latent_head_mode=vector_diffusion` is the default and expects continuous latent vectors shaped to `latent_vector_dim`.
+- `policy.latent_valid_key` should indicate whether the latent target is usable for a sample.
+- `policy.latent_supervision_key` and `policy.action_supervision_key` are optional per-sample boolean masks that decide whether each loss branch is applied.
+- the effective latent gate is `latent_valid_key AND latent_supervision_key` when both are configured.
+- prefer a top-level latent namespace such as `latent_labels.*`; do not store latent labels under `observation.*` because dataset observation delta expansion will add extra temporal axes.
 - `policy.training_mode=latent` is latent-only training and is not intended for action inference.
 
 ## Notes

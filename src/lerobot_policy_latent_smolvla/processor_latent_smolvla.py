@@ -78,6 +78,7 @@ def _make_batch_to_transition_with_latent_keys(
         key
         for key in [
             config.latent_label_key,
+            config.latent_valid_key,
             config.latent_supervision_key,
             config.action_supervision_key,
         ]

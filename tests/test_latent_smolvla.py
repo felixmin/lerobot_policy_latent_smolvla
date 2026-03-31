@@ -3,6 +3,7 @@ import torch
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+from lerobot.types import TransitionKey
 
 from lerobot_policy_latent_smolvla.configuration_latent_smolvla import LatentSmolVLAConfig
 from lerobot_policy_latent_smolvla.loss_utils import (
@@ -13,16 +14,50 @@ from lerobot_policy_latent_smolvla.loss_utils import (
     reduce_vector_flow_per_sample,
     reshape_latent_vector_sequence,
 )
+from lerobot_policy_latent_smolvla.processor_latent_smolvla import (
+    _make_batch_to_transition_with_latent_keys,
+)
 
 
 def test_config_defaults():
     config = LatentSmolVLAConfig()
     assert config.training_mode == "multitask"
-    assert config.latent_head_mode == "index_cross_entropy"
-    assert config.latent_label_key == "latent_labels"
+    assert config.latent_head_mode == "vector_diffusion"
+    assert config.latent_label_key == "latent_labels.continuous_vector_latents"
+    assert config.latent_valid_key == "latent_labels.valid"
+    assert config.latent_supervision_key is None
+    assert config.action_supervision_key is None
     assert not isinstance(config, SmolVLAConfig)
     assert isinstance(config.get_optimizer_preset(), AdamWConfig)
     assert isinstance(config.get_scheduler_preset(), CosineDecayWithWarmupSchedulerConfig)
+
+
+def test_preserve_configured_latent_and_supervision_keys():
+    config = LatentSmolVLAConfig(
+        latent_supervision_key="latent_supervision",
+        action_supervision_key="action_supervision",
+    )
+    to_transition = _make_batch_to_transition_with_latent_keys(config)
+    batch = {
+        config.latent_label_key: torch.randn(2, 12),
+        config.latent_valid_key: torch.tensor([True, False]),
+        config.latent_supervision_key: torch.tensor([True, True]),
+        config.action_supervision_key: torch.tensor([True, False]),
+    }
+
+    transition = to_transition(batch)
+    complementary_data = transition[TransitionKey.COMPLEMENTARY_DATA]
+
+    assert torch.equal(complementary_data[config.latent_label_key], batch[config.latent_label_key])
+    assert torch.equal(complementary_data[config.latent_valid_key], batch[config.latent_valid_key])
+    assert torch.equal(
+        complementary_data[config.latent_supervision_key],
+        batch[config.latent_supervision_key],
+    )
+    assert torch.equal(
+        complementary_data[config.action_supervision_key],
+        batch[config.action_supervision_key],
+    )
 
 
 def test_pool_hidden_masked_mean():

@@ -686,7 +686,14 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
                 labels,
                 ignore_index=int(self.config.latent_ignore_index),
             )
-            keep = valid_samples & make_sample_keep_mask(
+            keep = valid_samples
+            keep = keep & make_sample_keep_mask(
+                batch,
+                key=self.config.latent_valid_key,
+                batch_size=per_sample_latent.shape[0],
+                device=per_sample_latent.device,
+            )
+            keep = keep & make_sample_keep_mask(
                 batch,
                 key=self.config.latent_supervision_key,
                 batch_size=per_sample_latent.shape[0],
@@ -725,6 +732,12 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         )
         per_sample_latent = reduce_vector_flow_per_sample(v_t, u_t)
         keep = make_sample_keep_mask(
+            batch,
+            key=self.config.latent_valid_key,
+            batch_size=per_sample_latent.shape[0],
+            device=per_sample_latent.device,
+        )
+        keep = keep & make_sample_keep_mask(
             batch,
             key=self.config.latent_supervision_key,
             batch_size=per_sample_latent.shape[0],

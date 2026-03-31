@@ -80,14 +80,17 @@ class LatentSmolVLAConfig(PreTrainedConfig):
 
     # Latent supervision.
     training_mode: str = "multitask"
-    latent_head_mode: str = "index_cross_entropy"
+    latent_head_mode: str = "vector_diffusion"
     action_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
 
     latent_codebook_size: int = 8
     latent_code_seq_len: int = 4
     latent_vector_dim: int = 128
-    latent_label_key: str = "latent_labels"
+    # Keep latent-related batch keys outside observation.* so dataset delta-timestamp
+    # expansion does not add extra observation-history axes.
+    latent_label_key: str = "latent_labels.continuous_vector_latents"
+    latent_valid_key: str | None = "latent_labels.valid"
     latent_ignore_index: int = -100
     latent_supervision_key: str | None = None
     action_supervision_key: str | None = None
