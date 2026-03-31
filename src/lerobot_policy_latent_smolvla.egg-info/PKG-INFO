@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: lerobot_policy_latent_smolvla
+Version: 0.1.0
+Summary: Standalone latent SmolVLA policy plugin for LeRobot.
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: lerobot
+Requires-Dist: torch
+
+# lerobot_policy_latent_smolvla
+
+Standalone LeRobot policy plugin for a latent-supervised SmolVLA variant.
+
+This package starts from the upstream SmolVLA policy and adds:
+
+- an auxiliary latent head
+- dataset-key-based latent targets
+- masked action and latent loss reduction for mixed-supervision batches
+
+It is intentionally lighter than the HLRP shared-core policy and does not perform
+online LAM inference.
