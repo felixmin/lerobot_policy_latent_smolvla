@@ -23,7 +23,6 @@ from lerobot_policy_latent_smolvla.loss_utils import (
     pool_hidden,
     reduce_action_per_sample,
     reduce_latent_per_sample,
-    reduce_vector_flow_per_sample,
     reshape_latent_vector_sequence,
     sample_beta_time,
 )
@@ -381,7 +380,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    def forward_latent(
+    def forward_latent_logits(
         self,
         images: list[torch.Tensor],
         img_masks: list[torch.Tensor],
@@ -435,6 +434,39 @@ class LatentSmolVLAFlowMatching(nn.Module):
         )
         suffix_out = suffix_out[:, -noisy_latents.shape[1] :].to(dtype=torch.float32)
         return self.latent_vector_out_proj(suffix_out)
+
+    def forward_latent_vector_losses(
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+        state: torch.Tensor | None,
+        latent_vectors: torch.Tensor,
+        noise: torch.Tensor | None = None,
+        time: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        target_seq = reshape_latent_vector_sequence(
+            latent_vectors,
+            latent_code_seq_len=int(self.config.latent_code_seq_len),
+            latent_vector_dim=int(self.config.latent_vector_dim),
+        )
+        if noise is None:
+            noise = torch.randn_like(target_seq)
+        if time is None:
+            time = sample_beta_time(
+                batch_size=int(target_seq.shape[0]),
+                device=target_seq.device,
+                dtype=target_seq.dtype,
+                alpha=float(self.config.latent_flow_beta_alpha),
+                beta=float(self.config.latent_flow_beta_beta),
+            )
+
+        x_t, u_t = make_noisy_target(target=target_seq, noise=noise, time=time)
+        v_t = self.forward_latent_vectors(
+            images, img_masks, lang_tokens, lang_masks, state, x_t, time
+        )
+        return F.mse_loss(u_t, v_t, reduction="none")
 
     def sample_actions(
         self,
@@ -679,7 +711,7 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
 
         if self.config.latent_head_mode == "index_cross_entropy":
-            logits = self.model.forward_latent(images, img_masks, lang_tokens, lang_masks, state)
+            logits = self.model.forward_latent_logits(images, img_masks, lang_tokens, lang_masks, state)
             labels = batch[latent_key].to(device=logits.device, dtype=torch.long)
             per_sample_latent, valid_samples, per_sample_acc, per_sample_conf = reduce_latent_per_sample(
                 logits,
@@ -713,24 +745,10 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             }
 
         labels = batch[latent_key].to(device=lang_tokens.device, dtype=torch.float32)
-        target_seq = reshape_latent_vector_sequence(
-            labels,
-            latent_code_seq_len=int(self.config.latent_code_seq_len),
-            latent_vector_dim=int(self.config.latent_vector_dim),
+        losses = self.model.forward_latent_vector_losses(
+            images, img_masks, lang_tokens, lang_masks, state, labels
         )
-        noise_seq = torch.randn_like(target_seq)
-        time = sample_beta_time(
-            batch_size=int(target_seq.shape[0]),
-            device=target_seq.device,
-            dtype=target_seq.dtype,
-            alpha=float(self.config.latent_flow_beta_alpha),
-            beta=float(self.config.latent_flow_beta_beta),
-        )
-        x_t, u_t = make_noisy_target(target=target_seq, noise=noise_seq, time=time)
-        v_t = self.model.forward_latent_vectors(
-            images, img_masks, lang_tokens, lang_masks, state, x_t, time
-        )
-        per_sample_latent = reduce_vector_flow_per_sample(v_t, u_t)
+        per_sample_latent = losses.mean(dim=tuple(range(1, losses.ndim)))
         keep = make_sample_keep_mask(
             batch,
             key=self.config.latent_valid_key,
