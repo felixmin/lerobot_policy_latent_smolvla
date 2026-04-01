@@ -1,4 +1,7 @@
+from types import SimpleNamespace
+
 import torch
+from torch import nn
 
 from lerobot.optim.optimizers import AdamWConfig
 from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
@@ -14,6 +17,7 @@ from lerobot_policy_latent_smolvla.loss_utils import (
     reduce_vector_flow_per_sample,
     reshape_latent_vector_sequence,
 )
+from lerobot_policy_latent_smolvla.modeling_latent_smolvla import LatentSmolVLAFlowMatching, LatentSmolVLAPolicy
 from lerobot_policy_latent_smolvla.processor_latent_smolvla import (
     _make_batch_to_transition_with_latent_keys,
 )
@@ -137,3 +141,128 @@ def test_reduce_vector_flow_per_sample_zero_when_equal():
     target = torch.randn(2, 3, 4)
     per_sample = reduce_vector_flow_per_sample(target, target)
     assert torch.allclose(per_sample, torch.zeros_like(per_sample))
+
+
+def test_policy_default_peft_targets_vector_mode_include_latent_vector_modules():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(latent_head_mode="vector_diffusion")
+
+    targets = policy._get_default_peft_targets()
+
+    assert "latent_in_proj" in targets["target_modules"]
+    assert "latent_time_mlp_in" in targets["target_modules"]
+    assert "latent_time_mlp_out" in targets["target_modules"]
+    assert "latent_vector_out_proj" in targets["target_modules"]
+    assert targets["modules_to_save"] == []
+
+
+def test_policy_default_peft_targets_index_ce_include_discrete_modules():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(latent_head_mode="index_cross_entropy")
+
+    targets = policy._get_default_peft_targets()
+
+    assert "latent_id_out_proj" in targets["target_modules"]
+    assert targets["modules_to_save"] == ["model.latent_id_query_embed"]
+
+
+def test_model_forward_returns_unreduced_action_losses_shape():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(chunk_size=4, max_action_dim=6)
+    model.action_out_proj = nn.Linear(7, 6)
+    model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
+    model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(2, 3, 7),
+        torch.ones(2, 3, dtype=torch.bool),
+        torch.zeros(2, 3, dtype=torch.bool),
+    )
+    model.embed_suffix = lambda noisy_actions, timestep: (
+        torch.zeros(noisy_actions.shape[0], noisy_actions.shape[1], 7),
+        torch.ones(noisy_actions.shape[0], noisy_actions.shape[1], dtype=torch.bool),
+        torch.ones(noisy_actions.shape[0], noisy_actions.shape[1]),
+    )
+
+    def fake_forward(**kwargs):
+        prefix_embs, suffix_embs = kwargs["inputs_embeds"]
+        assert prefix_embs is not None
+        assert suffix_embs is not None
+        assert kwargs["fill_kv_cache"] is False
+        return ([prefix_embs, torch.ones_like(suffix_embs)], None)
+
+    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
+
+    actions = torch.randn(2, 4, 6)
+    losses = model.forward(None, None, None, None, None, actions)
+    assert losses.shape == actions.shape
+
+
+def test_forward_latent_id_logits_uses_suffix_queries():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(latent_code_seq_len=3, latent_codebook_size=5)
+    model.latent_id_out_proj = nn.Linear(7, 5)
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(2, 4, 7),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(2, 4, dtype=torch.bool),
+    )
+    model.embed_latent_id_suffix = lambda *, batch_size, device, dtype: (
+        torch.zeros(batch_size, 3, 7, dtype=dtype, device=device),
+        torch.ones(batch_size, 3, dtype=torch.bool, device=device),
+        torch.ones(batch_size, 3, dtype=dtype, device=device),
+    )
+
+    def fake_forward(**kwargs):
+        assert kwargs["inputs_embeds"][1] is not None
+        assert kwargs["fill_kv_cache"] is False
+        suffix_embs = kwargs["inputs_embeds"][1]
+        return ([None, torch.ones_like(suffix_embs)], None)
+
+    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
+
+    logits = model.forward_latent_id_logits(None, None, None, None, None)
+    assert logits.shape == (2, 3, 5)
+
+
+def test_forward_latent_vector_losses_returns_unreduced_shape():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        latent_code_seq_len=3,
+        latent_vector_dim=12,
+        latent_flow_beta_alpha=1.5,
+        latent_flow_beta_beta=1.0,
+    )
+    model.latent_vector_out_proj = nn.Linear(7, 4)
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(2, 4, 7),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(2, 4, dtype=torch.bool),
+    )
+    model.embed_latent_vector_suffix = lambda noisy_latents, timestep: (
+        torch.zeros(noisy_latents.shape[0], noisy_latents.shape[1], 7),
+        torch.ones(noisy_latents.shape[0], noisy_latents.shape[1], dtype=torch.bool),
+        torch.ones(noisy_latents.shape[0], noisy_latents.shape[1]),
+    )
+
+    def fake_forward(**kwargs):
+        assert kwargs["inputs_embeds"][1] is not None
+        suffix_embs = kwargs["inputs_embeds"][1]
+        return ([None, torch.ones_like(suffix_embs)], None)
+
+    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
+
+    latent_vectors = torch.randn(2, 3, 4)
+    losses = model.forward_latent_vector_losses(
+        None,
+        None,
+        None,
+        None,
+        None,
+        latent_vectors,
+        noise=torch.zeros_like(latent_vectors),
+        time=torch.full((2,), 0.5),
+    )
+    assert losses.shape == latent_vectors.shape

@@ -20,7 +20,6 @@ from lerobot_policy_latent_smolvla.loss_utils import (
     make_noisy_target,
     make_sample_keep_mask,
     masked_mean_or_zero,
-    pool_hidden,
     reduce_action_per_sample,
     reduce_latent_per_sample,
     reshape_latent_vector_sequence,
@@ -167,13 +166,11 @@ class LatentSmolVLAFlowMatching(nn.Module):
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
 
-        hidden_dim = self.vlm_with_expert.config.text_config.hidden_size
+        expert_hidden = self.vlm_with_expert.expert_hidden_size
         if config.latent_head_mode == "index_cross_entropy":
-            self.latent_head = nn.Linear(
-                hidden_dim, config.latent_code_seq_len * config.latent_codebook_size
-            )
+            self.latent_id_query_embed = nn.Embedding(config.latent_code_seq_len, expert_hidden)
+            self.latent_id_out_proj = nn.Linear(expert_hidden, config.latent_codebook_size)
         else:
-            expert_hidden = self.vlm_with_expert.expert_hidden_size
             latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
             self.latent_in_proj = nn.Linear(latent_step_dim, expert_hidden)
             self.latent_time_mlp_in = nn.Linear(expert_hidden * 2, expert_hidden)
@@ -317,7 +314,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         )[None, :].expand(batch_size, -1)
         return action_time_emb, pad_masks, att_masks
 
-    def embed_latent_suffix(
+    def embed_latent_vector_suffix(
         self,
         noisy_latents: torch.Tensor,
         timestep: torch.Tensor,
@@ -347,7 +344,23 @@ class LatentSmolVLAFlowMatching(nn.Module):
         )
         return latent_time_emb, latent_mask, att_masks
 
-    def forward_action_losses(
+    def embed_latent_id_suffix(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        latent_positions = torch.arange(
+            self.config.latent_code_seq_len, device=device, dtype=torch.long
+        )
+        latent_queries = self.latent_id_query_embed(latent_positions).to(dtype=dtype)
+        latent_queries = latent_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        latent_mask = torch.ones(batch_size, latent_queries.shape[1], dtype=torch.bool, device=device)
+        att_masks = torch.ones(batch_size, latent_queries.shape[1], dtype=dtype, device=device)
+        return latent_queries, latent_mask, att_masks
+
+    def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
         if noise is None:
@@ -380,7 +393,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         return F.mse_loss(u_t, v_t, reduction="none")
 
-    def forward_latent_logits(
+    def forward_latent_id_logits(
         self,
         images: list[torch.Tensor],
         img_masks: list[torch.Tensor],
@@ -391,20 +404,25 @@ class LatentSmolVLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        position_ids = torch.cumsum(prefix_pad_masks.long(), dim=1) - 1
-        outputs_embeds, _ = self.vlm_with_expert.forward(
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_id_suffix(
+            batch_size=prefix_embs.shape[0],
+            device=prefix_embs.device,
+            dtype=prefix_embs.dtype,
+        )
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks.long(), dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=att_2d_masks,
             position_ids=position_ids,
             past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
+            inputs_embeds=[prefix_embs, suffix_embs],
             use_cache=False,
-            fill_kv_cache=True,
+            fill_kv_cache=False,
         )
-        prefix_out = outputs_embeds[0]
-        pooled = pool_hidden(prefix_out, prefix_pad_masks)
-        logits = self.latent_head(pooled)
-        return logits.view(-1, self.config.latent_code_seq_len, self.config.latent_codebook_size)
+        suffix_out = suffix_out[:, -self.config.latent_code_seq_len :].to(dtype=torch.float32)
+        return self.latent_id_out_proj(suffix_out)
 
     def forward_latent_vector_losses(
         self,
@@ -437,7 +455,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_vector_suffix(x_t, time)
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
@@ -662,7 +680,7 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         actions = self.prepare_action(batch)
         action_is_pad = batch.get("action_is_pad")
 
-        losses = self.model.forward_action_losses(
+        losses = self.model.forward(
             images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
         )
         per_sample_action = reduce_action_per_sample(
@@ -683,7 +701,7 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             "batch_action_supervised_denominator": float(int(per_sample_action.shape[0])),
         }
 
-    def _forward_latent_branch(
+    def _forward_latent_id_branch(
         self,
         batch: dict[str, Tensor],
     ) -> tuple[Tensor, dict[str, float]]:
@@ -695,41 +713,51 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+        logits = self.model.forward_latent_id_logits(images, img_masks, lang_tokens, lang_masks, state)
+        labels = batch[latent_key].to(device=logits.device, dtype=torch.long)
+        per_sample_latent, valid_samples, per_sample_acc, per_sample_conf = reduce_latent_per_sample(
+            logits,
+            labels,
+            ignore_index=int(self.config.latent_ignore_index),
+        )
+        keep = valid_samples
+        keep = keep & make_sample_keep_mask(
+            batch,
+            key=self.config.latent_valid_key,
+            batch_size=per_sample_latent.shape[0],
+            device=per_sample_latent.device,
+        )
+        keep = keep & make_sample_keep_mask(
+            batch,
+            key=self.config.latent_supervision_key,
+            batch_size=per_sample_latent.shape[0],
+            device=per_sample_latent.device,
+        )
+        latent_loss, kept = masked_mean_or_zero(per_sample_latent, keep)
+        latent_acc, _ = masked_mean_or_zero(per_sample_acc, keep)
+        latent_conf, _ = masked_mean_or_zero(per_sample_conf, keep)
+        return latent_loss, {
+            "latent_loss": float(latent_loss.detach().cpu()),
+            "latent_accuracy": float(latent_acc.detach().cpu()),
+            "latent_confidence": float(latent_conf.detach().cpu()),
+            "latent_supervised_samples": float(kept),
+            "batch_latent_supervised_denominator": float(int(per_sample_latent.shape[0])),
+            "latent_head_mode_index_cross_entropy": 1.0,
+            "latent_head_mode_vector_diffusion": 0.0,
+        }
 
-        if self.config.latent_head_mode == "index_cross_entropy":
-            logits = self.model.forward_latent_logits(images, img_masks, lang_tokens, lang_masks, state)
-            labels = batch[latent_key].to(device=logits.device, dtype=torch.long)
-            per_sample_latent, valid_samples, per_sample_acc, per_sample_conf = reduce_latent_per_sample(
-                logits,
-                labels,
-                ignore_index=int(self.config.latent_ignore_index),
-            )
-            keep = valid_samples
-            keep = keep & make_sample_keep_mask(
-                batch,
-                key=self.config.latent_valid_key,
-                batch_size=per_sample_latent.shape[0],
-                device=per_sample_latent.device,
-            )
-            keep = keep & make_sample_keep_mask(
-                batch,
-                key=self.config.latent_supervision_key,
-                batch_size=per_sample_latent.shape[0],
-                device=per_sample_latent.device,
-            )
-            latent_loss, kept = masked_mean_or_zero(per_sample_latent, keep)
-            latent_acc, _ = masked_mean_or_zero(per_sample_acc, keep)
-            latent_conf, _ = masked_mean_or_zero(per_sample_conf, keep)
-            return latent_loss, {
-                "latent_loss": float(latent_loss.detach().cpu()),
-                "latent_accuracy": float(latent_acc.detach().cpu()),
-                "latent_confidence": float(latent_conf.detach().cpu()),
-                "latent_supervised_samples": float(kept),
-                "batch_latent_supervised_denominator": float(int(per_sample_latent.shape[0])),
-                "latent_head_mode_index_cross_entropy": 1.0,
-                "latent_head_mode_vector_diffusion": 0.0,
-            }
+    def _forward_latent_vector_branch(
+        self,
+        batch: dict[str, Tensor],
+    ) -> tuple[Tensor, dict[str, float]]:
+        latent_key = str(self.config.latent_label_key)
+        if latent_key not in batch:
+            raise KeyError(f"Missing latent label batch key {latent_key!r}")
 
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[OBS_LANGUAGE_TOKENS]
+        lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         labels = batch[latent_key].to(device=lang_tokens.device, dtype=torch.float32)
         losses = self.model.forward_latent_vector_losses(
             images, img_masks, lang_tokens, lang_masks, state, labels
@@ -775,7 +803,10 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             total = float(self.config.action_loss_weight) * action_loss
 
         if self.config.training_mode in {"latent", "multitask"}:
-            latent_loss, latent_metrics = self._forward_latent_branch(batch)
+            if self.config.latent_head_mode == "index_cross_entropy":
+                latent_loss, latent_metrics = self._forward_latent_id_branch(batch)
+            else:
+                latent_loss, latent_metrics = self._forward_latent_vector_branch(batch)
             metrics.update(latent_metrics)
             weighted_latent = float(self.config.latent_loss_weight) * latent_loss
             total = weighted_latent if total is None else total + weighted_latent
@@ -843,11 +874,33 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         return self._queues[ACTION].popleft()
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        common_projections = "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
-        target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        common_projections = [
+            "state_proj",
+            "action_in_proj",
+            "action_out_proj",
+            "action_time_mlp_in",
+            "action_time_mlp_out",
+        ]
+        modules_to_save: list[str] = []
+        if self.config.latent_head_mode == "index_cross_entropy":
+            common_projections.append("latent_id_out_proj")
+            modules_to_save.append("model.latent_id_query_embed")
+        else:
+            common_projections.extend(
+                [
+                    "latent_in_proj",
+                    "latent_time_mlp_in",
+                    "latent_time_mlp_out",
+                    "latent_vector_out_proj",
+                ]
+            )
+        common_projection_pattern = "|".join(common_projections)
+        target_modules = (
+            rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projection_pattern}))"
+        )
         return {
             "target_modules": target_modules,
-            "modules_to_save": [],
+            "modules_to_save": modules_to_save,
         }
 
     def _validate_peft_config(self, peft_config) -> None:
