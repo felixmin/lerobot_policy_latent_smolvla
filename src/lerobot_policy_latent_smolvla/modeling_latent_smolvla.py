@@ -406,35 +406,6 @@ class LatentSmolVLAFlowMatching(nn.Module):
         logits = self.latent_head(pooled)
         return logits.view(-1, self.config.latent_code_seq_len, self.config.latent_codebook_size)
 
-    def forward_latent_vectors(
-        self,
-        images: list[torch.Tensor],
-        img_masks: list[torch.Tensor],
-        lang_tokens: torch.Tensor,
-        lang_masks: torch.Tensor,
-        state: torch.Tensor | None,
-        noisy_latents: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> torch.Tensor:
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_suffix(noisy_latents, timestep)
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            fill_kv_cache=False,
-        )
-        suffix_out = suffix_out[:, -noisy_latents.shape[1] :].to(dtype=torch.float32)
-        return self.latent_vector_out_proj(suffix_out)
-
     def forward_latent_vector_losses(
         self,
         images: list[torch.Tensor],
@@ -463,9 +434,24 @@ class LatentSmolVLAFlowMatching(nn.Module):
             )
 
         x_t, u_t = make_noisy_target(target=target_seq, noise=noise, time=time)
-        v_t = self.forward_latent_vectors(
-            images, img_masks, lang_tokens, lang_masks, state, x_t, time
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
         )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_suffix(x_t, time)
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        suffix_out = suffix_out[:, -target_seq.shape[1] :].to(dtype=torch.float32)
+        v_t = self.latent_vector_out_proj(suffix_out)
         return F.mse_loss(u_t, v_t, reduction="none")
 
     def sample_actions(
