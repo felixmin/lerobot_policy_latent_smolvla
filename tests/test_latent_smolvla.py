@@ -10,7 +10,6 @@ from lerobot.types import TransitionKey
 
 from lerobot_policy_latent_smolvla.configuration_latent_smolvla import LatentSmolVLAConfig
 from lerobot_policy_latent_smolvla.loss_utils import (
-    make_noisy_target,
     make_sample_keep_mask,
     pool_hidden,
     reduce_latent_per_sample,
@@ -127,11 +126,13 @@ def test_reshape_latent_vector_sequence_from_flat():
     assert torch.equal(seq.reshape(2, 12), vectors)
 
 
-def test_make_noisy_target_shapes():
+def test_inline_noisy_target_shapes():
     target = torch.ones(2, 3, 4)
     noise = torch.zeros_like(target)
     time = torch.tensor([0.25, 0.75])
-    x_t, u_t = make_noisy_target(target=target, noise=noise, time=time)
+    time_expanded = time[:, None, None]
+    x_t = time_expanded * noise + (1 - time_expanded) * target
+    u_t = noise - target
     assert x_t.shape == target.shape
     assert u_t.shape == target.shape
     assert torch.allclose(u_t, -torch.ones_like(target))

@@ -17,7 +17,6 @@ from lerobot.utils.device_utils import get_safe_dtype
 
 from lerobot_policy_latent_smolvla.configuration_latent_smolvla import LatentSmolVLAConfig
 from lerobot_policy_latent_smolvla.loss_utils import (
-    make_noisy_target,
     make_sample_keep_mask,
     masked_mean_or_zero,
     reduce_action_per_sample,
@@ -451,7 +450,9 @@ class LatentSmolVLAFlowMatching(nn.Module):
                 beta=float(self.config.latent_flow_beta_beta),
             )
 
-        x_t, u_t = make_noisy_target(target=target_seq, noise=noise, time=time)
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * target_seq
+        u_t = noise - target_seq
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )

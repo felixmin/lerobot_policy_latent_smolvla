@@ -120,18 +120,6 @@ def sample_beta_time(
     return time_beta * 0.999 + 0.001
 
 
-def make_noisy_target(
-    *,
-    target: torch.Tensor,
-    noise: torch.Tensor,
-    time: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    time_expanded = time.reshape(time.shape[0], *([1] * (target.ndim - 1)))
-    x_t = time_expanded * noise + (1.0 - time_expanded) * target
-    u_t = noise - target
-    return x_t, u_t
-
-
 def reduce_vector_flow_per_sample(
     predicted_velocity: torch.Tensor,
     target_velocity: torch.Tensor,
