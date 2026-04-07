@@ -18,6 +18,7 @@ from lerobot_policy_latent_smolvla.loss_utils import (
 )
 from lerobot_policy_latent_smolvla.modeling_latent_smolvla import LatentSmolVLAFlowMatching, LatentSmolVLAPolicy
 from lerobot_policy_latent_smolvla.processor_latent_smolvla import (
+    LatentSmolVLALatentTargetNormalizer,
     _make_batch_to_transition_with_latent_keys,
 )
 
@@ -28,6 +29,7 @@ def test_config_defaults():
     assert config.latent_head_mode == "vector_diffusion"
     assert config.latent_label_key == "latent_labels.continuous_vector_latents"
     assert config.latent_valid_key == "latent_labels.valid"
+    assert config.normalize_latent_targets is True
     assert config.latent_supervision_key is None
     assert config.action_supervision_key is None
     assert not isinstance(config, SmolVLAConfig)
@@ -60,6 +62,71 @@ def test_preserve_configured_latent_and_supervision_keys():
     assert torch.equal(
         complementary_data[config.action_supervision_key],
         batch[config.action_supervision_key],
+    )
+
+
+def test_latent_target_normalizer_applies_mean_std_to_complementary_data():
+    step = LatentSmolVLALatentTargetNormalizer(
+        latent_label_key="latent_labels.continuous_vector_latents",
+        stats={
+            "mean": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "std": torch.tensor([[2.0, 4.0], [5.0, 10.0]]),
+        },
+    )
+    transition = {
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "latent_labels.continuous_vector_latents": torch.tensor(
+                [[[3.0, 6.0], [8.0, 14.0]]],
+                dtype=torch.float32,
+            )
+        }
+    }
+
+    transformed = step(transition)
+    expected = torch.tensor([[[1.0, 1.0], [1.0, 1.0]]], dtype=torch.float32)
+    assert torch.allclose(
+        transformed[TransitionKey.COMPLEMENTARY_DATA]["latent_labels.continuous_vector_latents"],
+        expected,
+    )
+
+
+def test_latent_target_normalizer_raises_when_enabled_without_stats():
+    step = LatentSmolVLALatentTargetNormalizer(
+        latent_label_key="latent_labels.continuous_vector_latents",
+        enabled=True,
+        stats=None,
+    )
+    transition = {
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "latent_labels.continuous_vector_latents": torch.ones(1, 2, 2, dtype=torch.float32)
+        }
+    }
+
+    try:
+        step(transition)
+    except ValueError as exc:
+        assert "stats are missing" in str(exc)
+    else:
+        raise AssertionError("Expected latent target normalization to require stats when enabled.")
+
+
+def test_latent_target_normalizer_leaves_discrete_labels_unchanged():
+    step = LatentSmolVLALatentTargetNormalizer(
+        latent_label_key="latent_labels.codebook_id_latents",
+        enabled=True,
+        stats=None,
+    )
+    labels = torch.tensor([[1, 2, 3]], dtype=torch.int64)
+    transition = {
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "latent_labels.codebook_id_latents": labels,
+        }
+    }
+
+    transformed = step(transition)
+    assert torch.equal(
+        transformed[TransitionKey.COMPLEMENTARY_DATA]["latent_labels.codebook_id_latents"],
+        labels,
     )
 
 

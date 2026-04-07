@@ -94,6 +94,8 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     latent_ignore_index: int = -100
     latent_supervision_key: str | None = None
     action_supervision_key: str | None = None
+    normalize_latent_targets: bool = True
+    latent_normalization_eps: float = 1e-8
     latent_flow_beta_alpha: float = 1.5
     latent_flow_beta_beta: float = 1.0
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -46,6 +47,12 @@ def make_latent_smolvla_pre_post_processors(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
+        ),
+        LatentSmolVLALatentTargetNormalizer(
+            latent_label_key=config.latent_label_key,
+            enabled=bool(config.normalize_latent_targets),
+            eps=float(config.latent_normalization_eps),
+            stats=None if dataset_stats is None else dataset_stats.get(config.latent_label_key),
         ),
     ]
     output_steps = [
@@ -118,6 +125,73 @@ class LatentSmolVLANewLineProcessor(ComplementaryDataProcessorStep):
                 t if t.endswith("\n") else f"{t}\n" for t in task
             ]
         return new_complementary_data
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+@dataclass
+@ProcessorStepRegistry.register(name="latent_smolvla_latent_target_normalizer")
+class LatentSmolVLALatentTargetNormalizer(ComplementaryDataProcessorStep):
+    latent_label_key: str
+    enabled: bool = True
+    eps: float = 1e-8
+    stats: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        self._mean: torch.Tensor | None = None
+        self._std: torch.Tensor | None = None
+        if self.stats is not None:
+            self._load_stats(self.stats)
+
+    def _load_stats(self, stats: dict[str, Any]) -> None:
+        mean = stats.get("mean")
+        std = stats.get("std")
+        if mean is None or std is None:
+            return
+        self._mean = torch.as_tensor(mean)
+        self._std = torch.as_tensor(std)
+
+    def complementary_data(self, complementary_data):
+        if not self.enabled:
+            return complementary_data
+        if self.latent_label_key not in complementary_data:
+            return complementary_data
+
+        latent_labels = complementary_data[self.latent_label_key]
+        if not torch.is_tensor(latent_labels):
+            latent_labels = torch.as_tensor(latent_labels)
+        if not torch.is_floating_point(latent_labels):
+            return complementary_data
+        if self._mean is None or self._std is None:
+            raise ValueError(
+                f"Latent normalization is enabled, but stats are missing for {self.latent_label_key!r}."
+            )
+
+        mean = self._mean.to(device=latent_labels.device, dtype=latent_labels.dtype)
+        std = self._std.to(device=latent_labels.device, dtype=latent_labels.dtype)
+
+        new_complementary_data = dict(complementary_data)
+        new_complementary_data[self.latent_label_key] = (latent_labels - mean) / (std + float(self.eps))
+        return new_complementary_data
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "latent_label_key": self.latent_label_key,
+            "enabled": self.enabled,
+            "eps": self.eps,
+        }
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        if self._mean is None or self._std is None:
+            return {}
+        return {"mean": self._mean, "std": self._std}
+
+    def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        self._mean = state.get("mean")
+        self._std = state.get("std")
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
