@@ -118,9 +118,9 @@ class LatentSmolVLAConfig(PreTrainedConfig):
                 "training_mode must be one of {'action', 'latent', 'multitask'}, "
                 f"got {self.training_mode!r}"
             )
-        if self.latent_head_mode not in {"index_cross_entropy", "vector_diffusion"}:
+        if self.latent_head_mode not in {"index_cross_entropy", "vector_diffusion", "vector_mse"}:
             raise ValueError(
-                "latent_head_mode must be one of {'index_cross_entropy', 'vector_diffusion'}, "
+                "latent_head_mode must be one of {'index_cross_entropy', 'vector_diffusion', 'vector_mse'}, "
                 f"got {self.latent_head_mode!r}"
             )
         if self.action_loss_weight < 0.0:

@@ -21,6 +21,7 @@ from lerobot_policy_latent_smolvla.loss_utils import (
     masked_mean_or_zero,
     reduce_action_per_sample,
     reduce_latent_per_sample,
+    reduce_vector_flow_per_sample,
     reshape_latent_vector_sequence,
     sample_beta_time,
 )
@@ -169,11 +170,15 @@ class LatentSmolVLAFlowMatching(nn.Module):
         if config.latent_head_mode == "index_cross_entropy":
             self.latent_id_query_embed = nn.Embedding(config.latent_code_seq_len, expert_hidden)
             self.latent_id_out_proj = nn.Linear(expert_hidden, config.latent_codebook_size)
-        else:
+        elif config.latent_head_mode == "vector_diffusion":
             latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
             self.latent_in_proj = nn.Linear(latent_step_dim, expert_hidden)
             self.latent_time_mlp_in = nn.Linear(expert_hidden * 2, expert_hidden)
             self.latent_time_mlp_out = nn.Linear(expert_hidden, expert_hidden)
+            self.latent_vector_out_proj = nn.Linear(expert_hidden, latent_step_dim)
+        else:
+            latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
+            self.latent_vector_query_embed = nn.Embedding(config.latent_code_seq_len, expert_hidden)
             self.latent_vector_out_proj = nn.Linear(expert_hidden, latent_step_dim)
 
         self.set_requires_grad()
@@ -359,6 +364,22 @@ class LatentSmolVLAFlowMatching(nn.Module):
         att_masks = torch.ones(batch_size, latent_queries.shape[1], dtype=dtype, device=device)
         return latent_queries, latent_mask, att_masks
 
+    def embed_latent_vector_query_suffix(
+        self,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        latent_positions = torch.arange(
+            self.config.latent_code_seq_len, device=device, dtype=torch.long
+        )
+        latent_queries = self.latent_vector_query_embed(latent_positions).to(dtype=dtype)
+        latent_queries = latent_queries.unsqueeze(0).expand(batch_size, -1, -1)
+        latent_mask = torch.ones(batch_size, latent_queries.shape[1], dtype=torch.bool, device=device)
+        att_masks = torch.ones(batch_size, latent_queries.shape[1], dtype=dtype, device=device)
+        return latent_queries, latent_mask, att_masks
+
     def forward(
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
@@ -472,6 +493,37 @@ class LatentSmolVLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -target_seq.shape[1] :].to(dtype=torch.float32)
         v_t = self.latent_vector_out_proj(suffix_out)
         return F.mse_loss(u_t, v_t, reduction="none")
+
+    def forward_latent_vector_predictions(
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+        state: torch.Tensor | None,
+    ) -> torch.Tensor:
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_vector_query_suffix(
+            batch_size=prefix_embs.shape[0],
+            device=prefix_embs.device,
+            dtype=prefix_embs.dtype,
+        )
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks.long(), dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        suffix_out = suffix_out[:, -self.config.latent_code_seq_len :].to(dtype=torch.float32)
+        return self.latent_vector_out_proj(suffix_out)
 
     def sample_actions(
         self,
@@ -745,12 +797,13 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             "batch_latent_supervised_denominator": float(int(per_sample_latent.shape[0])),
             "latent_head_mode_index_cross_entropy": 1.0,
             "latent_head_mode_vector_diffusion": 0.0,
+            "latent_head_mode_vector_mse": 0.0,
         }
 
-    def _forward_latent_vector_branch(
+    def _prepare_latent_vector_batch(
         self,
         batch: dict[str, Tensor],
-    ) -> tuple[Tensor, dict[str, float]]:
+    ) -> tuple[list[Tensor], list[Tensor], Tensor, Tensor, Tensor, Tensor]:
         latent_key = str(self.config.latent_label_key)
         if latent_key not in batch:
             raise KeyError(f"Missing latent label batch key {latent_key!r}")
@@ -760,10 +813,13 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         labels = batch[latent_key].to(device=lang_tokens.device, dtype=torch.float32)
-        losses = self.model.forward_latent_vector_losses(
-            images, img_masks, lang_tokens, lang_masks, state, labels
-        )
-        per_sample_latent = losses.mean(dim=tuple(range(1, losses.ndim)))
+        return images, img_masks, lang_tokens, lang_masks, state, labels
+
+    def _reduce_masked_latent_vector_loss(
+        self,
+        batch: dict[str, Tensor],
+        per_sample_latent: Tensor,
+    ) -> tuple[Tensor, dict[str, float]]:
         keep = make_sample_keep_mask(
             batch,
             key=self.config.latent_valid_key,
@@ -781,9 +837,50 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             "latent_loss": float(latent_loss.detach().cpu()),
             "latent_supervised_samples": float(kept),
             "batch_latent_supervised_denominator": float(int(per_sample_latent.shape[0])),
-            "latent_head_mode_index_cross_entropy": 0.0,
-            "latent_head_mode_vector_diffusion": 1.0,
         }
+
+    def _forward_latent_diffusion_branch(
+        self,
+        batch: dict[str, Tensor],
+    ) -> tuple[Tensor, dict[str, float]]:
+        images, img_masks, lang_tokens, lang_masks, state, labels = self._prepare_latent_vector_batch(batch)
+        losses = self.model.forward_latent_vector_losses(
+            images, img_masks, lang_tokens, lang_masks, state, labels
+        )
+        per_sample_latent = losses.mean(dim=tuple(range(1, losses.ndim)))
+        latent_loss, metrics = self._reduce_masked_latent_vector_loss(batch, per_sample_latent)
+        metrics.update(
+            {
+                "latent_head_mode_index_cross_entropy": 0.0,
+                "latent_head_mode_vector_diffusion": 1.0,
+                "latent_head_mode_vector_mse": 0.0,
+            }
+        )
+        return latent_loss, metrics
+
+    def _forward_latent_mse_branch(
+        self,
+        batch: dict[str, Tensor],
+    ) -> tuple[Tensor, dict[str, float]]:
+        images, img_masks, lang_tokens, lang_masks, state, labels = self._prepare_latent_vector_batch(batch)
+        targets = reshape_latent_vector_sequence(
+            labels,
+            latent_code_seq_len=int(self.config.latent_code_seq_len),
+            latent_vector_dim=int(self.config.latent_vector_dim),
+        )
+        predictions = self.model.forward_latent_vector_predictions(
+            images, img_masks, lang_tokens, lang_masks, state
+        )
+        per_sample_latent = reduce_vector_flow_per_sample(predictions, targets)
+        latent_loss, metrics = self._reduce_masked_latent_vector_loss(batch, per_sample_latent)
+        metrics.update(
+            {
+                "latent_head_mode_index_cross_entropy": 0.0,
+                "latent_head_mode_vector_diffusion": 0.0,
+                "latent_head_mode_vector_mse": 1.0,
+            }
+        )
+        return latent_loss, metrics
 
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
@@ -806,8 +903,12 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         if self.config.training_mode in {"latent", "multitask"}:
             if self.config.latent_head_mode == "index_cross_entropy":
                 latent_loss, latent_metrics = self._forward_latent_id_branch(batch)
+            elif self.config.latent_head_mode == "vector_diffusion":
+                latent_loss, latent_metrics = self._forward_latent_diffusion_branch(batch)
+            elif self.config.latent_head_mode == "vector_mse":
+                latent_loss, latent_metrics = self._forward_latent_mse_branch(batch)
             else:
-                latent_loss, latent_metrics = self._forward_latent_vector_branch(batch)
+                raise RuntimeError(f"Unsupported latent_head_mode: {self.config.latent_head_mode!r}")
             metrics.update(latent_metrics)
             weighted_latent = float(self.config.latent_loss_weight) * latent_loss
             total = weighted_latent if total is None else total + weighted_latent
@@ -886,7 +987,7 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         if self.config.latent_head_mode == "index_cross_entropy":
             common_projections.append("latent_id_out_proj")
             modules_to_save.append("model.latent_id_query_embed")
-        else:
+        elif self.config.latent_head_mode == "vector_diffusion":
             common_projections.extend(
                 [
                     "latent_in_proj",
@@ -895,6 +996,9 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
                     "latent_vector_out_proj",
                 ]
             )
+        else:
+            common_projections.append("latent_vector_out_proj")
+            modules_to_save.append("model.latent_vector_query_embed")
         common_projection_pattern = "|".join(common_projections)
         target_modules = (
             rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projection_pattern}))"

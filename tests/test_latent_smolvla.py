@@ -37,6 +37,11 @@ def test_config_defaults():
     assert isinstance(config.get_scheduler_preset(), CosineDecayWithWarmupSchedulerConfig)
 
 
+def test_config_accepts_vector_mse_latent_head_mode():
+    config = LatentSmolVLAConfig(latent_head_mode="vector_mse")
+    assert config.latent_head_mode == "vector_mse"
+
+
 def test_preserve_configured_latent_and_supervision_keys():
     config = LatentSmolVLAConfig(
         latent_supervision_key="latent_supervision",
@@ -234,6 +239,16 @@ def test_policy_default_peft_targets_index_ce_include_discrete_modules():
     assert targets["modules_to_save"] == ["model.latent_id_query_embed"]
 
 
+def test_policy_default_peft_targets_vector_mse_include_query_modules():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(latent_head_mode="vector_mse")
+
+    targets = policy._get_default_peft_targets()
+
+    assert "latent_vector_out_proj" in targets["target_modules"]
+    assert targets["modules_to_save"] == ["model.latent_vector_query_embed"]
+
+
 def test_model_forward_returns_unreduced_action_losses_shape():
     model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
     nn.Module.__init__(model)
@@ -334,3 +349,61 @@ def test_forward_latent_vector_losses_returns_unreduced_shape():
         time=torch.full((2,), 0.5),
     )
     assert losses.shape == latent_vectors.shape
+
+
+def test_forward_latent_vector_predictions_use_suffix_queries():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(latent_code_seq_len=3)
+    model.latent_vector_out_proj = nn.Linear(7, 4)
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(2, 4, 7),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(2, 4, dtype=torch.bool),
+    )
+    model.embed_latent_vector_query_suffix = lambda *, batch_size, device, dtype: (
+        torch.zeros(batch_size, 3, 7, dtype=dtype, device=device),
+        torch.ones(batch_size, 3, dtype=torch.bool, device=device),
+        torch.ones(batch_size, 3, dtype=dtype, device=device),
+    )
+
+    def fake_forward(**kwargs):
+        assert kwargs["inputs_embeds"][1] is not None
+        assert kwargs["fill_kv_cache"] is False
+        suffix_embs = kwargs["inputs_embeds"][1]
+        return ([None, torch.ones_like(suffix_embs)], None)
+
+    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
+
+    predictions = model.forward_latent_vector_predictions(None, None, None, None, None)
+    assert predictions.shape == (2, 3, 4)
+
+
+def test_forward_latent_mse_branch_runs_and_reports_mode_metrics():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        latent_head_mode="vector_mse",
+        latent_label_key="latent_labels.continuous_vector_latents",
+        latent_code_seq_len=3,
+        latent_vector_dim=12,
+        latent_valid_key=None,
+        latent_supervision_key=None,
+    )
+    policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
+    policy.prepare_state = lambda batch: torch.zeros(2, 6)
+    policy.model = SimpleNamespace(
+        forward_latent_vector_predictions=lambda *args, **kwargs: torch.zeros(2, 3, 4)
+    )
+
+    batch = {
+        "latent_labels.continuous_vector_latents": torch.randn(2, 3, 4),
+        "observation.language.tokens": torch.zeros(2, 5, dtype=torch.long),
+        "observation.language.attention_mask": torch.ones(2, 5, dtype=torch.bool),
+    }
+
+    latent_loss, metrics = policy._forward_latent_mse_branch(batch)
+
+    assert latent_loss.ndim == 0
+    assert metrics["latent_head_mode_index_cross_entropy"] == 0.0
+    assert metrics["latent_head_mode_vector_diffusion"] == 0.0
+    assert metrics["latent_head_mode_vector_mse"] == 1.0
