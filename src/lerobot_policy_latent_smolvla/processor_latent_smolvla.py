@@ -154,6 +154,33 @@ class LatentSmolVLALatentTargetNormalizer(ComplementaryDataProcessorStep):
         self._mean = torch.as_tensor(mean)
         self._std = torch.as_tensor(std)
 
+    def _normalize_latent_labels(self, latent_labels: torch.Tensor) -> torch.Tensor:
+        if self._mean is None or self._std is None:
+            raise ValueError(
+                f"Latent normalization is enabled, but stats are missing for {self.latent_label_key!r}."
+            )
+
+        mean = self._mean.to(device=latent_labels.device, dtype=latent_labels.dtype)
+        std = self._std.to(device=latent_labels.device, dtype=latent_labels.dtype)
+
+        if latent_labels.shape[-mean.ndim :] == mean.shape:
+            return (latent_labels - mean) / (std + float(self.eps))
+
+        flat_feature_dim = 1
+        for dim in mean.shape:
+            flat_feature_dim *= int(dim)
+
+        if latent_labels.ndim >= 1 and int(latent_labels.shape[-1]) == flat_feature_dim:
+            normalized = (
+                latent_labels.reshape(*latent_labels.shape[:-1], *mean.shape) - mean
+            ) / (std + float(self.eps))
+            return normalized.reshape_as(latent_labels)
+
+        raise ValueError(
+            "Latent normalization stats shape is incompatible with latent labels: "
+            f"labels={tuple(latent_labels.shape)} stats={tuple(mean.shape)}"
+        )
+
     def complementary_data(self, complementary_data):
         if not self.enabled:
             return complementary_data
@@ -165,16 +192,9 @@ class LatentSmolVLALatentTargetNormalizer(ComplementaryDataProcessorStep):
             latent_labels = torch.as_tensor(latent_labels)
         if not torch.is_floating_point(latent_labels):
             return complementary_data
-        if self._mean is None or self._std is None:
-            raise ValueError(
-                f"Latent normalization is enabled, but stats are missing for {self.latent_label_key!r}."
-            )
-
-        mean = self._mean.to(device=latent_labels.device, dtype=latent_labels.dtype)
-        std = self._std.to(device=latent_labels.device, dtype=latent_labels.dtype)
 
         new_complementary_data = dict(complementary_data)
-        new_complementary_data[self.latent_label_key] = (latent_labels - mean) / (std + float(self.eps))
+        new_complementary_data[self.latent_label_key] = self._normalize_latent_labels(latent_labels)
         return new_complementary_data
 
     def get_config(self) -> dict[str, Any]:

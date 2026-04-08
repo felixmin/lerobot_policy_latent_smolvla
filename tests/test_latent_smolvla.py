@@ -95,6 +95,31 @@ def test_latent_target_normalizer_applies_mean_std_to_complementary_data():
     )
 
 
+def test_latent_target_normalizer_supports_flat_labels_with_structured_stats():
+    step = LatentSmolVLALatentTargetNormalizer(
+        latent_label_key="latent_labels.continuous_vector_latents",
+        stats={
+            "mean": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "std": torch.tensor([[2.0, 4.0], [5.0, 10.0]]),
+        },
+    )
+    transition = {
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "latent_labels.continuous_vector_latents": torch.tensor(
+                [[3.0, 6.0, 8.0, 14.0]],
+                dtype=torch.float32,
+            )
+        }
+    }
+
+    transformed = step(transition)
+    expected = torch.tensor([[1.0, 1.0, 1.0, 1.0]], dtype=torch.float32)
+    assert torch.allclose(
+        transformed[TransitionKey.COMPLEMENTARY_DATA]["latent_labels.continuous_vector_latents"],
+        expected,
+    )
+
+
 def test_latent_target_normalizer_raises_when_enabled_without_stats():
     step = LatentSmolVLALatentTargetNormalizer(
         latent_label_key="latent_labels.continuous_vector_latents",
