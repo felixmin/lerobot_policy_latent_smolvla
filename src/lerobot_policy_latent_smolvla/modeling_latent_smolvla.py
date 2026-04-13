@@ -17,11 +17,11 @@ from lerobot.utils.device_utils import get_safe_dtype
 
 from lerobot_policy_latent_smolvla.configuration_latent_smolvla import LatentSmolVLAConfig
 from lerobot_policy_latent_smolvla.loss_utils import (
+    expand_keep_mask,
     make_sample_keep_mask,
+    make_sequence_keep_mask,
     masked_mean_or_zero,
     reduce_action_per_sample,
-    reduce_latent_per_sample,
-    reduce_vector_flow_per_sample,
     reshape_latent_vector_sequence,
     sample_beta_time,
 )
@@ -134,8 +134,38 @@ def pad_tensor(tensor, max_len, pad_value=0):
     return padded_tensor
 
 
+def masked_rms(values: Tensor, keep: Tensor) -> float:
+    keep = keep.bool()
+    if not torch.any(keep):
+        return 0.0
+    selected = values.detach().to(dtype=torch.float32).masked_select(expand_keep_mask(values, keep))
+    return float(torch.sqrt(torch.mean(selected.square())).cpu())
+
+
+def masked_abs_mean(values: Tensor, keep: Tensor) -> float:
+    keep = keep.bool()
+    if not torch.any(keep):
+        return 0.0
+    selected = values.detach().to(dtype=torch.float32).masked_select(expand_keep_mask(values, keep))
+    return float(selected.abs().mean().cpu())
+
+
+def parameter_grad_l2_norm(parameters: list[nn.Parameter]) -> float:
+    sq_norm = 0.0
+    has_grad = False
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().to(dtype=torch.float32)
+        sq_norm += float(grad.square().sum().item())
+        has_grad = True
+    if not has_grad:
+        return 0.0
+    return sq_norm**0.5
+
+
 class LatentSmolVLAFlowMatching(nn.Module):
-    """Self-contained SmolVLA-style core with an auxiliary latent head."""
+    """Self-contained SmolVLA-style core with packed joint latent/action diffusion."""
 
     def __init__(self, config: LatentSmolVLAConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
@@ -157,29 +187,20 @@ class LatentSmolVLAFlowMatching(nn.Module):
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
-        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
-        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
-        self.action_time_mlp_in = nn.Linear(
+        self.joint_motion_in_proj = nn.Linear(
+            2 * self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size
+        )
+        self.joint_motion_out_proj = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size, 2 * self.config.max_action_dim
+        )
+        self.joint_motion_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
         )
-        self.action_time_mlp_out = nn.Linear(
+        self.joint_motion_time_mlp_out = nn.Linear(
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
-
-        expert_hidden = self.vlm_with_expert.expert_hidden_size
-        if config.latent_head_mode == "index_cross_entropy":
-            self.latent_id_query_embed = nn.Embedding(config.latent_code_seq_len, expert_hidden)
-            self.latent_id_out_proj = nn.Linear(expert_hidden, config.latent_codebook_size)
-        elif config.latent_head_mode == "vector_diffusion":
-            latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
-            self.latent_in_proj = nn.Linear(latent_step_dim, expert_hidden)
-            self.latent_time_mlp_in = nn.Linear(expert_hidden * 2, expert_hidden)
-            self.latent_time_mlp_out = nn.Linear(expert_hidden, expert_hidden)
-            self.latent_vector_out_proj = nn.Linear(expert_hidden, latent_step_dim)
-        else:
-            latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
-            self.latent_vector_query_embed = nn.Embedding(config.latent_code_seq_len, expert_hidden)
-            self.latent_vector_out_proj = nn.Linear(expert_hidden, latent_step_dim)
+        self.latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
+        self.joint_motion_dim = 2 * int(config.max_action_dim)
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -213,9 +234,13 @@ class LatentSmolVLAFlowMatching(nn.Module):
         )
 
     def sample_time(self, batch_size, device):
-        beta_dist = torch.distributions.Beta(concentration1=1.5, concentration0=1.0)
-        time_beta = beta_dist.sample((batch_size,)).to(device=device, dtype=torch.float32)
-        return time_beta * 0.999 + 0.001
+        return sample_beta_time(
+            batch_size=int(batch_size),
+            device=device,
+            dtype=torch.float32,
+            alpha=float(self.config.latent_flow_beta_alpha),
+            beta=float(self.config.latent_flow_beta_beta),
+        )
 
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
@@ -292,41 +317,20 @@ class LatentSmolVLAFlowMatching(nn.Module):
 
         return embs, pad_masks, att_masks.expand(batch_size, -1)
 
-    def embed_suffix(self, noisy_actions, timestep):
-        action_emb = self.action_in_proj(noisy_actions)
-        device = action_emb.device
-        batch_size = action_emb.shape[0]
-        dtype = action_emb.dtype
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.vlm_with_expert.expert_hidden_size,
-            self.config.min_period,
-            self.config.max_period,
-            device=device,
-        ).to(dtype=dtype)
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
-        action_time_emb = self.action_time_mlp_in(action_time_emb)
-        action_time_emb = F.silu(action_time_emb)
-        action_time_emb = self.action_time_mlp_out(action_time_emb)
-
-        pad_masks = torch.ones(
-            batch_size, action_time_emb.shape[1], dtype=torch.bool, device=device
-        )
-        att_masks = torch.tensor(
-            [1] * self.config.chunk_size, dtype=action_time_emb.dtype, device=device
-        )[None, :].expand(batch_size, -1)
-        return action_time_emb, pad_masks, att_masks
-
-    def embed_latent_vector_suffix(
+    def embed_suffix(
         self,
-        noisy_latents: torch.Tensor,
+        noisy_motion: torch.Tensor,
         timestep: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        latent_emb = self.latent_in_proj(noisy_latents)
-        device = latent_emb.device
-        batch_size = latent_emb.shape[0]
-        dtype = latent_emb.dtype
+        if int(noisy_motion.shape[-1]) != int(self.joint_motion_dim):
+            raise ValueError(
+                "Expected packed joint motion suffix with shape [B, S, 2 * max_action_dim], "
+                f"got {tuple(noisy_motion.shape)}"
+            )
+        motion_emb = self.joint_motion_in_proj(noisy_motion)
+        device = motion_emb.device
+        batch_size = motion_emb.shape[0]
+        dtype = motion_emb.dtype
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.vlm_with_expert.expert_hidden_size,
@@ -334,196 +338,228 @@ class LatentSmolVLAFlowMatching(nn.Module):
             self.config.max_period,
             device=device,
         ).to(dtype=dtype)
-        time_emb = time_emb[:, None, :].expand_as(latent_emb)
-        latent_time_emb = torch.cat([latent_emb, time_emb], dim=2)
-        latent_time_emb = self.latent_time_mlp_in(latent_time_emb)
-        latent_time_emb = F.silu(latent_time_emb)
-        latent_time_emb = self.latent_time_mlp_out(latent_time_emb)
+        time_emb = time_emb[:, None, :].expand_as(motion_emb)
+        motion_time_emb = torch.cat([motion_emb, time_emb], dim=2)
+        motion_time_emb = self.joint_motion_time_mlp_in(motion_time_emb)
+        motion_time_emb = F.silu(motion_time_emb)
+        motion_time_emb = self.joint_motion_time_mlp_out(motion_time_emb)
 
-        latent_mask = torch.ones(
-            batch_size, latent_time_emb.shape[1], dtype=torch.bool, device=device
+        pad_masks = torch.ones(
+            batch_size, motion_time_emb.shape[1], dtype=torch.bool, device=device
         )
         att_masks = torch.ones(
-            batch_size, latent_time_emb.shape[1], dtype=latent_time_emb.dtype, device=device
+            batch_size, motion_time_emb.shape[1], dtype=motion_time_emb.dtype, device=device
         )
-        return latent_time_emb, latent_mask, att_masks
+        return motion_time_emb, pad_masks, att_masks
 
-    def embed_latent_id_suffix(
+    def _forward_suffix_hidden(
         self,
+        *,
+        prefix_embs: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        prefix_att_masks: torch.Tensor,
+        suffix_embs: torch.Tensor,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        (_, suffix_out), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            fill_kv_cache=False,
+        )
+        return suffix_out.to(dtype=torch.float32)
+
+    def _prepare_latent_targets(
+        self,
+        latent_vectors: torch.Tensor | None,
         *,
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        latent_positions = torch.arange(
-            self.config.latent_code_seq_len, device=device, dtype=torch.long
-        )
-        latent_queries = self.latent_id_query_embed(latent_positions).to(dtype=dtype)
-        latent_queries = latent_queries.unsqueeze(0).expand(batch_size, -1, -1)
-        latent_mask = torch.ones(batch_size, latent_queries.shape[1], dtype=torch.bool, device=device)
-        att_masks = torch.ones(batch_size, latent_queries.shape[1], dtype=dtype, device=device)
-        return latent_queries, latent_mask, att_masks
+    ) -> torch.Tensor:
+        if latent_vectors is None:
+            return torch.zeros(
+                batch_size,
+                self.config.chunk_size,
+                self.latent_step_dim,
+                device=device,
+                dtype=dtype,
+            )
+        target_seq = reshape_latent_vector_sequence(
+            latent_vectors,
+            latent_code_seq_len=int(self.config.latent_code_seq_len),
+            latent_vector_dim=int(self.config.latent_vector_dim),
+        ).to(device=device, dtype=dtype)
+        target_seq = torch.nan_to_num(target_seq, nan=0.0, posinf=0.0, neginf=0.0)
+        if int(target_seq.shape[1]) != int(self.config.chunk_size):
+            raise ValueError(
+                "Packed joint diffusion requires latent sequence length to match chunk_size, "
+                f"got latent_seq_len={target_seq.shape[1]} chunk_size={self.config.chunk_size}"
+            )
+        if int(target_seq.shape[2]) > int(self.config.max_action_dim):
+            raise ValueError(
+                "Packed joint diffusion requires latent step dim <= max_action_dim, "
+                f"got latent_step_dim={target_seq.shape[2]} max_action_dim={self.config.max_action_dim}"
+            )
+        return target_seq
 
-    def embed_latent_vector_query_suffix(
+    def _prepare_action_targets(
         self,
+        actions: torch.Tensor | None,
         *,
         batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        latent_positions = torch.arange(
-            self.config.latent_code_seq_len, device=device, dtype=torch.long
-        )
-        latent_queries = self.latent_vector_query_embed(latent_positions).to(dtype=dtype)
-        latent_queries = latent_queries.unsqueeze(0).expand(batch_size, -1, -1)
-        latent_mask = torch.ones(batch_size, latent_queries.shape[1], dtype=torch.bool, device=device)
-        att_masks = torch.ones(batch_size, latent_queries.shape[1], dtype=dtype, device=device)
-        return latent_queries, latent_mask, att_masks
+    ) -> torch.Tensor:
+        if actions is None:
+            return torch.zeros(
+                batch_size,
+                self.config.chunk_size,
+                self.config.max_action_dim,
+                device=device,
+                dtype=dtype,
+            )
+        return actions.to(device=device, dtype=dtype)
 
-    def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
-    ) -> Tensor:
+    def _pack_joint_motion_targets(
+        self,
+        *,
+        action_targets: torch.Tensor,
+        latent_targets: torch.Tensor,
+    ) -> torch.Tensor:
+        latent_padded = (
+            latent_targets
+            if int(latent_targets.shape[-1]) == int(self.config.max_action_dim)
+            else pad_vector(latent_targets, self.config.max_action_dim)
+        )
+        return torch.cat([latent_padded, action_targets], dim=-1)
+
+    def _split_joint_motion(
+        self,
+        joint_motion: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        latent_motion = joint_motion[..., : self.config.max_action_dim][..., : self.latent_step_dim]
+        action_motion = joint_motion[..., self.config.max_action_dim :]
+        return latent_motion, action_motion
+
+    def _prepare_joint_noise(
+        self,
+        noise: torch.Tensor | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        joint_shape = (batch_size, self.config.chunk_size, self.joint_motion_dim)
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            return self.sample_noise(joint_shape, device)
+        noise = noise.to(device=device, dtype=dtype)
+        if tuple(noise.shape) == joint_shape:
+            return noise
+        action_shape = (batch_size, self.config.chunk_size, self.config.max_action_dim)
+        if tuple(noise.shape) == action_shape:
+            latent_noise = self.sample_noise(action_shape, device)
+            return torch.cat([latent_noise.to(dtype=dtype), noise], dim=-1)
+        raise ValueError(
+            "Expected diffusion noise shaped like action targets or packed joint targets, "
+            f"got {tuple(noise.shape)}"
+        )
+
+    def forward_joint_motion_losses(
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+        state: torch.Tensor | None,
+        actions: torch.Tensor | None,
+        latent_vectors: torch.Tensor | None,
+        noise: torch.Tensor | None = None,
+        time: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(state.shape[0])
+        device = state.device
+        dtype = torch.float32
+        action_targets = self._prepare_action_targets(
+            actions,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        latent_targets = self._prepare_latent_targets(
+            latent_vectors,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        joint_targets = self._pack_joint_motion_targets(
+            action_targets=action_targets,
+            latent_targets=latent_targets,
+        )
+        joint_noise = self._prepare_joint_noise(
+            noise,
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(batch_size, device)
 
         time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t = time_expanded * joint_noise + (1 - time_expanded) * joint_targets
+        u_t = joint_noise - joint_targets
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            fill_kv_cache=False,
+        suffix_out = self._forward_suffix_hidden(
+            prefix_embs=prefix_embs,
+            prefix_pad_masks=prefix_pad_masks,
+            prefix_att_masks=prefix_att_masks,
+            suffix_embs=suffix_embs,
+            suffix_pad_masks=suffix_pad_masks,
+            suffix_att_masks=suffix_att_masks,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        return F.mse_loss(u_t, v_t, reduction="none")
+        v_t = self.joint_motion_out_proj(suffix_out)
+        latent_u_t, action_u_t = self._split_joint_motion(u_t)
+        latent_v_t, action_v_t = self._split_joint_motion(v_t)
+        action_losses = F.mse_loss(action_u_t, action_v_t, reduction="none")
+        latent_losses = F.mse_loss(latent_u_t, latent_v_t, reduction="none")
+        return action_losses, latent_losses
 
-    def forward_latent_id_logits(
+    def forward(
         self,
-        images: list[torch.Tensor],
-        img_masks: list[torch.Tensor],
-        lang_tokens: torch.Tensor,
-        lang_masks: torch.Tensor,
-        state: torch.Tensor | None,
-    ) -> torch.Tensor:
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_id_suffix(
-            batch_size=prefix_embs.shape[0],
-            device=prefix_embs.device,
-            dtype=prefix_embs.dtype,
-        )
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks.long(), dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            fill_kv_cache=False,
-        )
-        suffix_out = suffix_out[:, -self.config.latent_code_seq_len :].to(dtype=torch.float32)
-        return self.latent_id_out_proj(suffix_out)
-
-    def forward_latent_vector_losses(
-        self,
-        images: list[torch.Tensor],
-        img_masks: list[torch.Tensor],
-        lang_tokens: torch.Tensor,
-        lang_masks: torch.Tensor,
-        state: torch.Tensor | None,
-        latent_vectors: torch.Tensor,
-        noise: torch.Tensor | None = None,
-        time: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        target_seq = reshape_latent_vector_sequence(
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state,
+        actions,
+        latent_vectors=None,
+        noise=None,
+        time=None,
+    ) -> Tensor:
+        action_losses, _ = self.forward_joint_motion_losses(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
             latent_vectors,
-            latent_code_seq_len=int(self.config.latent_code_seq_len),
-            latent_vector_dim=int(self.config.latent_vector_dim),
+            noise=noise,
+            time=time,
         )
-        if noise is None:
-            noise = torch.randn_like(target_seq)
-        if time is None:
-            time = sample_beta_time(
-                batch_size=int(target_seq.shape[0]),
-                device=target_seq.device,
-                dtype=target_seq.dtype,
-                alpha=float(self.config.latent_flow_beta_alpha),
-                beta=float(self.config.latent_flow_beta_beta),
-            )
-
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * target_seq
-        u_t = noise - target_seq
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_vector_suffix(x_t, time)
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            fill_kv_cache=False,
-        )
-        suffix_out = suffix_out[:, -target_seq.shape[1] :].to(dtype=torch.float32)
-        v_t = self.latent_vector_out_proj(suffix_out)
-        return F.mse_loss(u_t, v_t, reduction="none")
-
-    def forward_latent_vector_predictions(
-        self,
-        images: list[torch.Tensor],
-        img_masks: list[torch.Tensor],
-        lang_tokens: torch.Tensor,
-        lang_masks: torch.Tensor,
-        state: torch.Tensor | None,
-    ) -> torch.Tensor:
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
-        )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_latent_vector_query_suffix(
-            batch_size=prefix_embs.shape[0],
-            device=prefix_embs.device,
-            dtype=prefix_embs.dtype,
-        )
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks.long(), dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-            fill_kv_cache=False,
-        )
-        suffix_out = suffix_out[:, -self.config.latent_code_seq_len :].to(dtype=torch.float32)
-        return self.latent_vector_out_proj(suffix_out)
+        return action_losses
 
     def sample_actions(
         self,
@@ -537,9 +573,12 @@ class LatentSmolVLAFlowMatching(nn.Module):
     ) -> Tensor:
         batch_size = state.shape[0]
         device = state.device
-        if noise is None:
-            actions_shape = (batch_size, self.config.chunk_size, self.config.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
+        joint_noise = self._prepare_joint_noise(
+            noise,
+            batch_size=batch_size,
+            device=device,
+            dtype=torch.float32,
+        )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
@@ -557,7 +596,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
-        x_t = noise
+        x_t = joint_noise
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(batch_size)
@@ -590,7 +629,8 @@ class LatentSmolVLAFlowMatching(nn.Module):
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
-        return x_t
+        _, action_motion = self._split_joint_motion(x_t)
+        return action_motion
 
     def denoise_step(
         self,
@@ -618,7 +658,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size :].to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)
+        return self.joint_motion_out_proj(suffix_out)
 
 
 class LatentSmolVLAPolicy(PreTrainedPolicy):
@@ -699,6 +739,190 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
     def prepare_action(self, batch):
         return pad_vector(batch[ACTION], self.config.max_action_dim)
 
+    def _make_action_keep_mask(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        batch_size: int,
+        device: torch.device,
+    ) -> Tensor:
+        return make_sample_keep_mask(
+            batch,
+            key=self.config.action_supervision_key,
+            batch_size=batch_size,
+            device=device,
+        )
+
+    def _make_latent_keep_mask(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        batch_size: int,
+        sequence_length: int,
+        device: torch.device,
+        valid_samples: Tensor | None = None,
+    ) -> Tensor:
+        keep = make_sequence_keep_mask(
+            batch,
+            key=self.config.latent_valid_key,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            device=device,
+        )
+        keep = keep & make_sequence_keep_mask(
+            batch,
+            key=self.config.latent_supervision_key,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            device=device,
+        )
+        if valid_samples is not None:
+            valid_samples = valid_samples.bool()
+            if valid_samples.ndim == 1:
+                keep = keep & valid_samples.reshape(batch_size, 1).expand(batch_size, sequence_length)
+            elif valid_samples.ndim == 2 and int(valid_samples.shape[1]) == int(sequence_length):
+                keep = keep & valid_samples
+            else:
+                raise ValueError(
+                    "valid_samples must be shaped [B] or [B,S] for latent sequence masking, "
+                    f"got {tuple(valid_samples.shape)}"
+                )
+        return keep
+
+    def _make_loss_metrics(
+        self,
+        *,
+        branch_name: str,
+        loss: Tensor,
+        kept: int | float,
+        denominator: int,
+        kept_exact: int | float | None = None,
+    ) -> dict[str, float | Tensor]:
+        kept_value = float(kept)
+        denominator_value = float(int(denominator))
+        kept_exact_value = float(kept_exact if kept_exact is not None else kept)
+        metrics: dict[str, float | Tensor] = {
+            f"{branch_name}_loss": float(loss.detach().cpu()),
+            f"{branch_name}_supervised_samples": kept_value,
+            f"batch_{branch_name}_supervised_samples": kept_value,
+            f"batch_{branch_name}_supervised_denominator": denominator_value,
+            f"batch_{branch_name}_supervised_fraction": (
+                kept_value / denominator_value if denominator_value > 0.0 else 0.0
+            ),
+            f"_{branch_name}_supervised_denominator": denominator_value,
+            f"_{branch_name}_loss_denominator_exact": kept_exact_value,
+            f"_{branch_name}_loss_tensor": loss,
+        }
+        return metrics
+
+    def _compute_joint_vector_target_metrics(
+        self,
+        batch: dict[str, Tensor],
+        labels: Tensor,
+        *,
+        action_keep: Tensor,
+        latent_keep: Tensor,
+    ) -> dict[str, float]:
+        batch_size = int(labels.shape[0])
+        latent_targets = reshape_latent_vector_sequence(
+            labels,
+            latent_code_seq_len=int(self.config.latent_code_seq_len),
+            latent_vector_dim=int(self.config.latent_vector_dim),
+        ).to(dtype=torch.float32)
+        sequence_length = int(latent_targets.shape[1])
+        action_step_keep = action_keep.bool().reshape(batch_size, 1).expand(batch_size, sequence_length)
+        if "action_is_pad" in batch:
+            action_step_keep = action_step_keep & (~batch["action_is_pad"].to(device=labels.device, dtype=torch.bool))
+        joint_step_keep = action_step_keep & latent_keep.bool()
+        joint_count = int(joint_step_keep.any(dim=1).sum().item())
+        joint_token_count = int(joint_step_keep.sum().item())
+        metrics: dict[str, float] = {
+            "batch_joint_supervised_samples": float(joint_count),
+            "batch_joint_supervised_denominator": float(batch_size),
+            "batch_joint_supervised_fraction": float(joint_count) / float(batch_size)
+            if batch_size > 0
+            else 0.0,
+            "batch_joint_supervised_tokens": float(joint_token_count),
+            "batch_joint_supervised_token_denominator": float(batch_size * sequence_length),
+            "batch_joint_supervised_token_fraction": (
+                float(joint_token_count) / float(batch_size * sequence_length)
+                if batch_size > 0 and sequence_length > 0
+                else 0.0
+            ),
+        }
+
+        if ACTION not in batch:
+            return metrics
+
+        raw_actions = batch[ACTION].to(device=labels.device, dtype=torch.float32)
+        metrics["action_target_rms"] = masked_rms(raw_actions, action_step_keep)
+        metrics["action_target_abs_mean"] = masked_abs_mean(raw_actions, action_step_keep)
+        metrics["latent_target_rms"] = masked_rms(latent_targets, latent_keep)
+        metrics["latent_target_abs_mean"] = masked_abs_mean(latent_targets, latent_keep)
+
+        if joint_token_count == 0:
+            return metrics
+
+        padded_actions = self.prepare_action(batch).to(device=labels.device, dtype=torch.float32)
+
+        metrics["joint_action_latent_target_numel_match_raw"] = float(
+            raw_actions.shape[-1] == latent_targets.shape[-1]
+        )
+        metrics["joint_action_latent_target_numel_match_padded"] = float(
+            padded_actions.shape[-1] == latent_targets.shape[-1]
+        )
+
+        action_targets = None
+        if raw_actions.shape[-1] == latent_targets.shape[-1]:
+            action_targets = raw_actions
+        elif padded_actions.shape[-1] == latent_targets.shape[-1]:
+            action_targets = padded_actions
+
+        if action_targets is None:
+            return metrics
+
+        joint_action = action_targets[joint_step_keep]
+        joint_latent = latent_targets[joint_step_keep]
+        diff = joint_action - joint_latent
+        cosine = F.cosine_similarity(joint_action, joint_latent, dim=1, eps=1e-8)
+        metrics["joint_action_latent_target_mse"] = float(diff.square().mean().detach().cpu())
+        metrics["joint_action_latent_target_abs_mean"] = float(diff.abs().mean().detach().cpu())
+        metrics["joint_action_latent_target_cosine"] = float(cosine.mean().detach().cpu())
+        return metrics
+
+    def get_gradient_metrics(self) -> dict[str, float]:
+        joint_motion_prefixes = (
+            "model.joint_motion_in_proj",
+            "model.joint_motion_out_proj",
+            "model.joint_motion_time_mlp_in",
+            "model.joint_motion_time_mlp_out",
+        )
+
+        joint_motion_parameters: list[nn.Parameter] = []
+        backbone_parameters: list[nn.Parameter] = []
+        all_parameters: list[nn.Parameter] = []
+
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            all_parameters.append(parameter)
+            if name.startswith(joint_motion_prefixes):
+                joint_motion_parameters.append(parameter)
+            else:
+                backbone_parameters.append(parameter)
+
+        joint_motion_norm = parameter_grad_l2_norm(joint_motion_parameters)
+        backbone_norm = parameter_grad_l2_norm(backbone_parameters)
+
+        return {
+            "grad_norm_model_total": parameter_grad_l2_norm(all_parameters),
+            "grad_norm_shared": backbone_norm,
+            "grad_norm_action_head": joint_motion_norm,
+            "grad_norm_latent_head": joint_motion_norm,
+            "grad_norm_backbone": backbone_norm,
+            "grad_norm_joint_motion": joint_motion_norm,
+        }
+
     def _pi_aloha_decode_state(self, state):
         for motor_idx in [1, 2, 8, 9]:
             state[:, motor_idx] *= -1
@@ -720,167 +944,110 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             actions[:, :, motor_idx] = aloha_gripper_from_angular_inv(actions[:, :, motor_idx])
         return actions
 
-    def _forward_action_branch(
+    def _forward_joint_diffusion_branch(
         self,
         batch: dict[str, Tensor],
         noise: Tensor | None,
         time: Tensor | None,
-    ) -> tuple[Tensor, dict[str, float]]:
+    ) -> tuple[
+        Tensor,
+        dict[str, float | Tensor],
+        Tensor,
+        Tensor,
+        dict[str, float | Tensor],
+        Tensor,
+        Tensor,
+    ]:
+        latent_key = str(self.config.latent_label_key)
+        if self.config.training_mode in {"action", "multitask"} and ACTION not in batch:
+            raise KeyError(f"Missing action batch key {ACTION!r}")
+        if self.config.training_mode in {"latent", "multitask"} and latent_key not in batch:
+            raise KeyError(f"Missing latent label batch key {latent_key!r}")
+
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
-        actions = self.prepare_action(batch)
+        labels = (
+            batch[latent_key].to(device=state.device, dtype=torch.float32)
+            if latent_key in batch
+            else None
+        )
+        actions = self.prepare_action(batch) if ACTION in batch else None
         action_is_pad = batch.get("action_is_pad")
-
-        losses = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+        action_losses, latent_losses = self.model.forward_joint_motion_losses(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            labels,
+            noise=noise,
+            time=time,
         )
         per_sample_action = reduce_action_per_sample(
-            losses,
+            action_losses,
             max_action_dim=self.config.max_action_dim,
             action_is_pad=action_is_pad,
         )
-        keep = make_sample_keep_mask(
-            batch,
-            key=self.config.action_supervision_key,
-            batch_size=per_sample_action.shape[0],
-            device=per_sample_action.device,
+        per_step_latent = latent_losses.mean(dim=-1)
+        batch_size = int(per_sample_action.shape[0])
+        action_keep = (
+            self._make_action_keep_mask(
+                batch,
+                batch_size=batch_size,
+                device=per_sample_action.device,
+            )
+            if self.config.training_mode in {"action", "multitask"}
+            else torch.zeros(batch_size, dtype=torch.bool, device=per_sample_action.device)
         )
-        action_loss, kept = masked_mean_or_zero(per_sample_action, keep)
-        return action_loss, {
-            "action_loss": float(action_loss.detach().cpu()),
-            "action_supervised_samples": float(kept),
-            "batch_action_supervised_denominator": float(int(per_sample_action.shape[0])),
-        }
+        latent_keep = (
+            self._make_latent_keep_mask(
+                batch,
+                batch_size=batch_size,
+                sequence_length=int(per_step_latent.shape[1]),
+                device=per_step_latent.device,
+            )
+            if self.config.training_mode in {"latent", "multitask"}
+            else torch.zeros(
+                batch_size,
+                int(per_step_latent.shape[1]),
+                dtype=torch.bool,
+                device=per_step_latent.device,
+            )
+        )
+        action_loss, action_kept = masked_mean_or_zero(per_sample_action, action_keep)
+        latent_loss, latent_kept_tokens = masked_mean_or_zero(per_step_latent, latent_keep)
+        latent_kept_samples = int(latent_keep.any(dim=1).sum().item())
 
-    def _forward_latent_id_branch(
-        self,
-        batch: dict[str, Tensor],
-    ) -> tuple[Tensor, dict[str, float]]:
-        latent_key = str(self.config.latent_label_key)
-        if latent_key not in batch:
-            raise KeyError(f"Missing latent label batch key {latent_key!r}")
-
-        images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
-        lang_tokens = batch[OBS_LANGUAGE_TOKENS]
-        lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
-        logits = self.model.forward_latent_id_logits(images, img_masks, lang_tokens, lang_masks, state)
-        labels = batch[latent_key].to(device=logits.device, dtype=torch.long)
-        per_sample_latent, valid_samples, per_sample_acc, per_sample_conf = reduce_latent_per_sample(
-            logits,
-            labels,
-            ignore_index=int(self.config.latent_ignore_index),
+        action_metrics = self._make_loss_metrics(
+            branch_name="action",
+            loss=action_loss,
+            kept=action_kept,
+            denominator=int(per_sample_action.shape[0]),
         )
-        keep = valid_samples
-        keep = keep & make_sample_keep_mask(
-            batch,
-            key=self.config.latent_valid_key,
-            batch_size=per_sample_latent.shape[0],
-            device=per_sample_latent.device,
+        latent_metrics = self._make_loss_metrics(
+            branch_name="latent",
+            loss=latent_loss,
+            kept=latent_kept_samples,
+            denominator=int(per_step_latent.shape[0]),
+            kept_exact=latent_kept_tokens,
         )
-        keep = keep & make_sample_keep_mask(
-            batch,
-            key=self.config.latent_supervision_key,
-            batch_size=per_sample_latent.shape[0],
-            device=per_sample_latent.device,
+        latent_metrics["batch_latent_supervised_tokens"] = float(latent_kept_tokens)
+        latent_metrics["batch_latent_supervised_token_denominator"] = float(
+            int(per_step_latent.shape[0]) * int(per_step_latent.shape[1])
         )
-        latent_loss, kept = masked_mean_or_zero(per_sample_latent, keep)
-        latent_acc, _ = masked_mean_or_zero(per_sample_acc, keep)
-        latent_conf, _ = masked_mean_or_zero(per_sample_conf, keep)
-        return latent_loss, {
-            "latent_loss": float(latent_loss.detach().cpu()),
-            "latent_accuracy": float(latent_acc.detach().cpu()),
-            "latent_confidence": float(latent_conf.detach().cpu()),
-            "latent_supervised_samples": float(kept),
-            "batch_latent_supervised_denominator": float(int(per_sample_latent.shape[0])),
-            "latent_head_mode_index_cross_entropy": 1.0,
-            "latent_head_mode_vector_diffusion": 0.0,
-            "latent_head_mode_vector_mse": 0.0,
-        }
-
-    def _prepare_latent_vector_batch(
-        self,
-        batch: dict[str, Tensor],
-    ) -> tuple[list[Tensor], list[Tensor], Tensor, Tensor, Tensor, Tensor]:
-        latent_key = str(self.config.latent_label_key)
-        if latent_key not in batch:
-            raise KeyError(f"Missing latent label batch key {latent_key!r}")
-
-        images, img_masks = self.prepare_images(batch)
-        state = self.prepare_state(batch)
-        lang_tokens = batch[OBS_LANGUAGE_TOKENS]
-        lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
-        labels = batch[latent_key].to(device=lang_tokens.device, dtype=torch.float32)
-        return images, img_masks, lang_tokens, lang_masks, state, labels
-
-    def _reduce_masked_latent_vector_loss(
-        self,
-        batch: dict[str, Tensor],
-        per_sample_latent: Tensor,
-    ) -> tuple[Tensor, dict[str, float]]:
-        keep = make_sample_keep_mask(
-            batch,
-            key=self.config.latent_valid_key,
-            batch_size=per_sample_latent.shape[0],
-            device=per_sample_latent.device,
+        latent_metrics["batch_latent_supervised_token_fraction"] = (
+            float(latent_kept_tokens)
+            / float(int(per_step_latent.shape[0]) * int(per_step_latent.shape[1]))
+            if int(per_step_latent.shape[0]) > 0 and int(per_step_latent.shape[1]) > 0
+            else 0.0
         )
-        keep = keep & make_sample_keep_mask(
-            batch,
-            key=self.config.latent_supervision_key,
-            batch_size=per_sample_latent.shape[0],
-            device=per_sample_latent.device,
-        )
-        latent_loss, kept = masked_mean_or_zero(per_sample_latent, keep)
-        return latent_loss, {
-            "latent_loss": float(latent_loss.detach().cpu()),
-            "latent_supervised_samples": float(kept),
-            "batch_latent_supervised_denominator": float(int(per_sample_latent.shape[0])),
-        }
-
-    def _forward_latent_diffusion_branch(
-        self,
-        batch: dict[str, Tensor],
-    ) -> tuple[Tensor, dict[str, float]]:
-        images, img_masks, lang_tokens, lang_masks, state, labels = self._prepare_latent_vector_batch(batch)
-        losses = self.model.forward_latent_vector_losses(
-            images, img_masks, lang_tokens, lang_masks, state, labels
-        )
-        per_sample_latent = losses.mean(dim=tuple(range(1, losses.ndim)))
-        latent_loss, metrics = self._reduce_masked_latent_vector_loss(batch, per_sample_latent)
-        metrics.update(
-            {
-                "latent_head_mode_index_cross_entropy": 0.0,
-                "latent_head_mode_vector_diffusion": 1.0,
-                "latent_head_mode_vector_mse": 0.0,
-            }
-        )
-        return latent_loss, metrics
-
-    def _forward_latent_mse_branch(
-        self,
-        batch: dict[str, Tensor],
-    ) -> tuple[Tensor, dict[str, float]]:
-        images, img_masks, lang_tokens, lang_masks, state, labels = self._prepare_latent_vector_batch(batch)
-        targets = reshape_latent_vector_sequence(
-            labels,
-            latent_code_seq_len=int(self.config.latent_code_seq_len),
-            latent_vector_dim=int(self.config.latent_vector_dim),
-        )
-        predictions = self.model.forward_latent_vector_predictions(
-            images, img_masks, lang_tokens, lang_masks, state
-        )
-        per_sample_latent = reduce_vector_flow_per_sample(predictions, targets)
-        latent_loss, metrics = self._reduce_masked_latent_vector_loss(batch, per_sample_latent)
-        metrics.update(
-            {
-                "latent_head_mode_index_cross_entropy": 0.0,
-                "latent_head_mode_vector_diffusion": 0.0,
-                "latent_head_mode_vector_mse": 1.0,
-            }
-        )
-        return latent_loss, metrics
+        action_metrics["joint_diffusion_forward"] = 1.0
+        latent_metrics["joint_diffusion_forward"] = 1.0
+        latent_metrics["latent_head_mode_joint_diffusion"] = 1.0
+        return action_loss, action_metrics, action_keep, latent_loss, latent_metrics, latent_keep, labels
 
     def forward(
         self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
@@ -892,34 +1059,60 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
-        metrics: dict[str, float] = {}
-        total = None
+        metrics: dict[str, float | Tensor] = {}
+        (
+            action_loss,
+            action_metrics,
+            action_keep,
+            latent_loss,
+            latent_metrics,
+            latent_keep,
+            latent_vector_labels,
+        ) = self._forward_joint_diffusion_branch(batch, noise, time)
+        metrics.update(action_metrics)
+        metrics.update(latent_metrics)
+        weighted_action = (
+            float(self.config.action_loss_weight) * action_loss
+            if self.config.training_mode in {"action", "multitask"}
+            else action_loss * 0.0
+        )
+        weighted_latent = (
+            float(self.config.latent_loss_weight) * latent_loss
+            if self.config.training_mode in {"latent", "multitask"}
+            else latent_loss * 0.0
+        )
+        total = weighted_action + weighted_latent
+        weighted_action_value = float(weighted_action.detach().cpu())
+        weighted_latent_value = float(weighted_latent.detach().cpu())
 
-        if self.config.training_mode in {"action", "multitask"}:
-            action_loss, action_metrics = self._forward_action_branch(batch, noise, time)
-            metrics.update(action_metrics)
-            total = float(self.config.action_loss_weight) * action_loss
+        if (
+            latent_vector_labels is not None
+            and action_keep is not None
+            and latent_keep is not None
+        ):
+            metrics.update(
+                self._compute_joint_vector_target_metrics(
+                    batch,
+                    latent_vector_labels,
+                    action_keep=action_keep,
+                    latent_keep=latent_keep,
+                )
+            )
 
-        if self.config.training_mode in {"latent", "multitask"}:
-            if self.config.latent_head_mode == "index_cross_entropy":
-                latent_loss, latent_metrics = self._forward_latent_id_branch(batch)
-            elif self.config.latent_head_mode == "vector_diffusion":
-                latent_loss, latent_metrics = self._forward_latent_diffusion_branch(batch)
-            elif self.config.latent_head_mode == "vector_mse":
-                latent_loss, latent_metrics = self._forward_latent_mse_branch(batch)
-            else:
-                raise RuntimeError(f"Unsupported latent_head_mode: {self.config.latent_head_mode!r}")
-            metrics.update(latent_metrics)
-            weighted_latent = float(self.config.latent_loss_weight) * latent_loss
-            total = weighted_latent if total is None else total + weighted_latent
-
-        if total is None:
-            raise RuntimeError(f"Unsupported training_mode: {self.config.training_mode!r}")
-
-        metrics["loss"] = float(total.detach().cpu())
+        total_value = float(total.detach().cpu())
+        metrics["loss"] = total_value
+        metrics["action_loss_weighted"] = weighted_action_value
+        metrics["latent_loss_weighted"] = weighted_latent_value
+        metrics["loss_weighted_action_fraction"] = (
+            weighted_action_value / total_value if total_value > 0.0 else 0.0
+        )
+        metrics["loss_weighted_latent_fraction"] = (
+            weighted_latent_value / total_value if total_value > 0.0 else 0.0
+        )
         metrics["mode_action"] = float(self.config.training_mode == "action")
         metrics["mode_latent"] = float(self.config.training_mode == "latent")
         metrics["mode_multitask"] = float(self.config.training_mode == "multitask")
+        metrics["latent_head_mode_joint_diffusion"] = 1.0
         return total, metrics
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
@@ -978,34 +1171,18 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
     def _get_default_peft_targets(self) -> dict[str, any]:
         common_projections = [
             "state_proj",
-            "action_in_proj",
-            "action_out_proj",
-            "action_time_mlp_in",
-            "action_time_mlp_out",
+            "joint_motion_in_proj",
+            "joint_motion_out_proj",
+            "joint_motion_time_mlp_in",
+            "joint_motion_time_mlp_out",
         ]
-        modules_to_save: list[str] = []
-        if self.config.latent_head_mode == "index_cross_entropy":
-            common_projections.append("latent_id_out_proj")
-            modules_to_save.append("model.latent_id_query_embed")
-        elif self.config.latent_head_mode == "vector_diffusion":
-            common_projections.extend(
-                [
-                    "latent_in_proj",
-                    "latent_time_mlp_in",
-                    "latent_time_mlp_out",
-                    "latent_vector_out_proj",
-                ]
-            )
-        else:
-            common_projections.append("latent_vector_out_proj")
-            modules_to_save.append("model.latent_vector_query_embed")
         common_projection_pattern = "|".join(common_projections)
         target_modules = (
             rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projection_pattern}))"
         )
         return {
             "target_modules": target_modules,
-            "modules_to_save": modules_to_save,
+            "modules_to_save": [],
         }
 
     def _validate_peft_config(self, peft_config) -> None:

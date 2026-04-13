@@ -176,6 +176,18 @@ class LatentSmolVLALatentTargetNormalizer(ComplementaryDataProcessorStep):
             ) / (std + float(self.eps))
             return normalized.reshape_as(latent_labels)
 
+        trailing_numel = 1
+        for start_idx in range(latent_labels.ndim - 1, -1, -1):
+            trailing_numel *= int(latent_labels.shape[start_idx])
+            if trailing_numel == flat_feature_dim:
+                labels_flat = latent_labels.reshape(*latent_labels.shape[:start_idx], flat_feature_dim)
+                mean_flat = mean.reshape(flat_feature_dim)
+                std_flat = std.reshape(flat_feature_dim)
+                normalized = (labels_flat - mean_flat) / (std_flat + float(self.eps))
+                return normalized.reshape_as(latent_labels)
+            if trailing_numel > flat_feature_dim:
+                break
+
         raise ValueError(
             "Latent normalization stats shape is incompatible with latent labels: "
             f"labels={tuple(latent_labels.shape)} stats={tuple(mean.shape)}"

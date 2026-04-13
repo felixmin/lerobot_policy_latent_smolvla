@@ -28,6 +28,64 @@ def make_sample_keep_mask(
     return mask.reshape(batch_size)
 
 
+def make_sequence_keep_mask(
+    batch: dict,
+    *,
+    key: str | None,
+    batch_size: int,
+    sequence_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if key is None:
+        return torch.ones(batch_size, sequence_length, dtype=torch.bool, device=device)
+    if key not in batch:
+        raise KeyError(f"Missing supervision key {key!r} in batch")
+
+    values = batch[key]
+    if torch.is_tensor(values):
+        mask = values.to(device=device, dtype=torch.bool)
+    else:
+        mask = torch.as_tensor(values, device=device, dtype=torch.bool)
+
+    if mask.ndim == 0:
+        raise ValueError(f"Expected sequence keep mask rank >= 1, got scalar for key {key!r}")
+    if int(mask.shape[0]) != int(batch_size):
+        raise ValueError(
+            f"Expected sequence keep mask batch size {batch_size}, got shape {tuple(mask.shape)}"
+        )
+    if mask.ndim == 1:
+        return mask.reshape(batch_size, 1).expand(batch_size, sequence_length)
+    if mask.ndim == 2:
+        if int(mask.shape[1]) == 1:
+            return mask.expand(batch_size, sequence_length)
+        if int(mask.shape[1]) == int(sequence_length):
+            return mask
+    raise ValueError(
+        "Expected sequence keep mask shaped [B], [B,1], or [B,S], "
+        f"got {tuple(mask.shape)} for key {key!r} and S={sequence_length}"
+    )
+
+
+def expand_keep_mask(values: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+    if int(values.shape[0]) != int(keep.shape[0]):
+        raise ValueError(
+            f"Expected values and keep mask to share batch dimension, got {values.shape[0]} and {keep.shape[0]}"
+        )
+    keep = keep.bool()
+    if keep.ndim == 1:
+        return keep.reshape(values.shape[0], *([1] * (values.ndim - 1))).expand_as(values)
+    if keep.ndim > values.ndim:
+        raise ValueError(
+            f"Keep mask rank must not exceed values rank, got keep={keep.ndim} values={values.ndim}"
+        )
+    if values.shape[: keep.ndim] != keep.shape:
+        raise ValueError(
+            f"Keep mask shape {tuple(keep.shape)} is incompatible with values shape {tuple(values.shape)}"
+        )
+    view_shape = tuple(keep.shape) + (1,) * (values.ndim - keep.ndim)
+    return keep.reshape(view_shape).expand_as(values)
+
+
 def reduce_action_per_sample(
     losses: torch.Tensor,
     *,
@@ -134,7 +192,8 @@ def reduce_vector_flow_per_sample(
 
 
 def masked_mean_or_zero(values: torch.Tensor, keep: torch.Tensor) -> tuple[torch.Tensor, int]:
-    kept = int(keep.sum().item())
+    kept = int(keep.bool().sum().item())
     if kept > 0:
-        return values[keep].mean(), kept
+        expanded_keep = expand_keep_mask(values, keep)
+        return values.masked_select(expanded_keep).mean(), kept
     return values.sum() * 0.0, 0

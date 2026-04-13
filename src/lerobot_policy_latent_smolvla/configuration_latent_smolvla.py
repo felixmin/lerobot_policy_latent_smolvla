@@ -11,7 +11,7 @@ from lerobot.utils.constants import OBS_IMAGES
 @PreTrainedConfig.register_subclass("latent_smolvla")
 @dataclass
 class LatentSmolVLAConfig(PreTrainedConfig):
-    """Standalone SmolVLA variant with optional latent supervision."""
+    """Standalone SmolVLA variant with packed joint latent/action diffusion."""
 
     # Input / output structure.
     n_obs_steps: int = 1
@@ -80,13 +80,13 @@ class LatentSmolVLAConfig(PreTrainedConfig):
 
     # Latent supervision.
     training_mode: str = "multitask"
-    latent_head_mode: str = "vector_diffusion"
+    latent_head_mode: str = "joint_diffusion"
     action_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
 
     latent_codebook_size: int = 8
-    latent_code_seq_len: int = 4
-    latent_vector_dim: int = 128
+    latent_code_seq_len: int = 50
+    latent_vector_dim: int = 1600
     # Keep latent-related batch keys outside observation.* so dataset delta-timestamp
     # expansion does not add extra observation-history axes.
     latent_label_key: str = "latent_labels.continuous_vector_latents"
@@ -118,9 +118,9 @@ class LatentSmolVLAConfig(PreTrainedConfig):
                 "training_mode must be one of {'action', 'latent', 'multitask'}, "
                 f"got {self.training_mode!r}"
             )
-        if self.latent_head_mode not in {"index_cross_entropy", "vector_diffusion", "vector_mse"}:
+        if self.latent_head_mode != "joint_diffusion":
             raise ValueError(
-                "latent_head_mode must be one of {'index_cross_entropy', 'vector_diffusion', 'vector_mse'}, "
+                "latent_head_mode must be 'joint_diffusion', "
                 f"got {self.latent_head_mode!r}"
             )
         if self.action_loss_weight < 0.0:
@@ -143,11 +143,22 @@ class LatentSmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"latent_vector_dim must be >= 1, got {self.latent_vector_dim}"
             )
+        if self.latent_code_seq_len != self.chunk_size:
+            raise ValueError(
+                "Packed joint diffusion requires latent_code_seq_len == chunk_size, "
+                f"got latent_code_seq_len={self.latent_code_seq_len} chunk_size={self.chunk_size}"
+            )
         if self.latent_vector_dim % self.latent_code_seq_len != 0:
             raise ValueError(
                 "latent_vector_dim must be divisible by latent_code_seq_len, "
                 f"got latent_vector_dim={self.latent_vector_dim} "
                 f"latent_code_seq_len={self.latent_code_seq_len}"
+            )
+        latent_step_dim = self.latent_vector_dim // self.latent_code_seq_len
+        if latent_step_dim > self.max_action_dim:
+            raise ValueError(
+                "Packed joint diffusion requires latent step dim <= max_action_dim, "
+                f"got latent_step_dim={latent_step_dim} max_action_dim={self.max_action_dim}"
             )
         if self.latent_flow_beta_alpha <= 0.0 or self.latent_flow_beta_beta <= 0.0:
             raise ValueError(
