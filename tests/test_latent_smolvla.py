@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -10,7 +11,10 @@ from lerobot.types import TransitionKey
 
 from lerobot_policy_latent_smolvla.configuration_latent_smolvla import LatentSmolVLAConfig
 from lerobot_policy_latent_smolvla.loss_utils import (
+    expand_keep_mask,
     make_sample_keep_mask,
+    make_sequence_keep_mask,
+    masked_mean_or_zero,
     pool_hidden,
     reduce_latent_per_sample,
     reduce_vector_flow_per_sample,
@@ -175,6 +179,52 @@ def test_make_sample_keep_mask_defaults_to_all_true():
     assert torch.equal(keep, torch.tensor([True, True, True]))
 
 
+def test_make_sequence_keep_mask_expands_sample_level_masks():
+    keep = make_sequence_keep_mask(
+        {"latent_labels.valid": torch.tensor([True, False])},
+        key="latent_labels.valid",
+        batch_size=2,
+        sequence_length=4,
+        device=torch.device("cpu"),
+    )
+    assert torch.equal(
+        keep,
+        torch.tensor([[True, True, True, True], [False, False, False, False]], dtype=torch.bool),
+    )
+
+
+def test_make_sequence_keep_mask_preserves_step_level_masks():
+    keep = make_sequence_keep_mask(
+        {"latent_labels.valid": torch.tensor([[True, False, True], [False, True, False]])},
+        key="latent_labels.valid",
+        batch_size=2,
+        sequence_length=3,
+        device=torch.device("cpu"),
+    )
+    assert torch.equal(
+        keep,
+        torch.tensor([[True, False, True], [False, True, False]], dtype=torch.bool),
+    )
+
+
+def test_expand_keep_mask_supports_sequence_masks():
+    values = torch.arange(2 * 3 * 2, dtype=torch.float32).reshape(2, 3, 2)
+    keep = torch.tensor([[True, False, True], [False, True, False]], dtype=torch.bool)
+    expanded = expand_keep_mask(values, keep)
+    assert expanded.shape == values.shape
+    assert expanded[0, 0].all()
+    assert not expanded[0, 1].any()
+    assert expanded[1, 1].all()
+
+
+def test_masked_mean_or_zero_supports_sequence_masks():
+    values = torch.tensor([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0]])
+    keep = torch.tensor([[True, False, True], [False, False, False]])
+    mean, kept = masked_mean_or_zero(values, keep)
+    assert kept == 2
+    assert float(mean) == pytest.approx(2.0)
+
+
 def test_reduce_latent_per_sample_ignores_missing_labels():
     logits = torch.tensor(
         [
@@ -239,6 +289,27 @@ def test_reduce_vector_flow_per_sample_zero_when_equal():
     target = torch.randn(2, 3, 4)
     per_sample = reduce_vector_flow_per_sample(target, target)
     assert torch.allclose(per_sample, torch.zeros_like(per_sample))
+
+
+def test_policy_latent_keep_mask_supports_sequence_validity():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        latent_valid_key="latent_labels.valid",
+        latent_supervision_key="latent_supervision",
+    )
+    keep = policy._make_latent_keep_mask(
+        {
+            "latent_labels.valid": torch.tensor([[True, False, True], [False, True, True]]),
+            "latent_supervision": torch.tensor([True, False]),
+        },
+        batch_size=2,
+        sequence_length=3,
+        device=torch.device("cpu"),
+    )
+    assert torch.equal(
+        keep,
+        torch.tensor([[True, False, True], [False, False, False]], dtype=torch.bool),
+    )
 
 
 def test_policy_default_peft_targets_vector_mode_include_latent_vector_modules():
@@ -376,6 +447,47 @@ def test_forward_latent_vector_losses_returns_unreduced_shape():
     assert losses.shape == latent_vectors.shape
 
 
+def test_forward_latent_vector_losses_sanitizes_nan_targets():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        latent_code_seq_len=3,
+        latent_vector_dim=12,
+        latent_flow_beta_alpha=1.5,
+        latent_flow_beta_beta=1.0,
+    )
+    model.latent_vector_out_proj = nn.Linear(7, 4)
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(1, 4, 7),
+        torch.ones(1, 4, dtype=torch.bool),
+        torch.zeros(1, 4, dtype=torch.bool),
+    )
+    model.embed_latent_vector_suffix = lambda noisy_latents, timestep: (
+        torch.zeros(noisy_latents.shape[0], noisy_latents.shape[1], 7),
+        torch.ones(noisy_latents.shape[0], noisy_latents.shape[1], dtype=torch.bool),
+        torch.ones(noisy_latents.shape[0], noisy_latents.shape[1]),
+    )
+
+    def fake_forward(**kwargs):
+        suffix_embs = kwargs["inputs_embeds"][1]
+        return ([None, torch.ones_like(suffix_embs)], None)
+
+    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
+
+    latent_vectors = torch.tensor([[[float("nan"), 1.0, 2.0, 3.0]] * 3], dtype=torch.float32)
+    losses = model.forward_latent_vector_losses(
+        None,
+        None,
+        None,
+        None,
+        None,
+        latent_vectors,
+        noise=torch.zeros_like(latent_vectors),
+        time=torch.full((1,), 0.5),
+    )
+    assert torch.isfinite(losses).all()
+
+
 def test_forward_latent_vector_predictions_use_suffix_queries():
     model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
     nn.Module.__init__(model)
@@ -426,9 +538,44 @@ def test_forward_latent_mse_branch_runs_and_reports_mode_metrics():
         "observation.language.attention_mask": torch.ones(2, 5, dtype=torch.bool),
     }
 
-    latent_loss, metrics = policy._forward_latent_mse_branch(batch)
+    latent_loss, metrics, keep, labels = policy._forward_latent_mse_branch(batch)
 
     assert latent_loss.ndim == 0
     assert metrics["latent_head_mode_index_cross_entropy"] == 0.0
     assert metrics["latent_head_mode_vector_diffusion"] == 0.0
     assert metrics["latent_head_mode_vector_mse"] == 1.0
+    assert torch.equal(keep, torch.ones(2, 3, dtype=torch.bool))
+    assert torch.equal(labels, batch["latent_labels.continuous_vector_latents"])
+
+
+def test_forward_latent_diffusion_branch_reports_token_metrics():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        latent_head_mode="vector_diffusion",
+        latent_label_key="latent_labels.continuous_vector_latents",
+        latent_code_seq_len=3,
+        latent_vector_dim=12,
+        latent_valid_key="latent_labels.valid",
+        latent_supervision_key=None,
+    )
+    policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
+    policy.prepare_state = lambda batch: torch.zeros(2, 6)
+    policy.model = SimpleNamespace(
+        forward_latent_vector_losses=lambda *args, **kwargs: torch.ones(2, 3, 4, dtype=torch.float32)
+    )
+
+    batch = {
+        "latent_labels.continuous_vector_latents": torch.randn(2, 3, 4),
+        "latent_labels.valid": torch.tensor([[True, False, True], [False, True, True]]),
+        "observation.language.tokens": torch.zeros(2, 5, dtype=torch.long),
+        "observation.language.attention_mask": torch.ones(2, 5, dtype=torch.bool),
+    }
+
+    latent_loss, metrics, keep, labels = policy._forward_latent_diffusion_branch(batch)
+
+    assert float(latent_loss) == pytest.approx(1.0)
+    assert metrics["batch_latent_supervised_tokens"] == 4.0
+    assert metrics["batch_latent_supervised_token_denominator"] == 6.0
+    assert metrics["batch_latent_supervised_token_fraction"] == pytest.approx(4.0 / 6.0)
+    assert torch.equal(keep, batch["latent_labels.valid"])
+    assert torch.equal(labels, batch["latent_labels.continuous_vector_latents"])
