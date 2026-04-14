@@ -152,6 +152,20 @@ def masked_abs_mean(values: Tensor, keep: Tensor) -> float:
     return float(selected.abs().mean().cpu())
 
 
+def parameter_grad_l2_norm(parameters: list[nn.Parameter]) -> float:
+    sq_norm = 0.0
+    has_grad = False
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        grad = parameter.grad.detach().to(dtype=torch.float32)
+        sq_norm += float(grad.square().sum().item())
+        has_grad = True
+    if not has_grad:
+        return 0.0
+    return sq_norm**0.5
+
+
 class LatentSmolVLAFlowMatching(nn.Module):
     """Self-contained SmolVLA-style core with an auxiliary latent head."""
 
@@ -868,6 +882,59 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         metrics["joint_action_latent_target_cosine"] = float(cosine.mean().detach().cpu())
         return metrics
 
+    def get_gradient_metrics(self) -> dict[str, float]:
+        action_prefixes = (
+            "model.action_in_proj",
+            "model.action_out_proj",
+            "model.action_time_mlp_in",
+            "model.action_time_mlp_out",
+        )
+        latent_prefixes_by_mode = {
+            "index_cross_entropy": (
+                "model.latent_id_query_embed",
+                "model.latent_id_out_proj",
+            ),
+            "vector_diffusion": (
+                "model.latent_in_proj",
+                "model.latent_time_mlp_in",
+                "model.latent_time_mlp_out",
+                "model.latent_vector_out_proj",
+            ),
+            "vector_mse": (
+                "model.latent_vector_query_embed",
+                "model.latent_vector_out_proj",
+            ),
+        }
+        latent_prefixes = latent_prefixes_by_mode[self.config.latent_head_mode]
+
+        action_parameters: list[nn.Parameter] = []
+        latent_parameters: list[nn.Parameter] = []
+        backbone_parameters: list[nn.Parameter] = []
+        all_parameters: list[nn.Parameter] = []
+
+        for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            all_parameters.append(parameter)
+            if name.startswith(action_prefixes):
+                action_parameters.append(parameter)
+            elif name.startswith(latent_prefixes):
+                latent_parameters.append(parameter)
+            else:
+                backbone_parameters.append(parameter)
+
+        action_norm = parameter_grad_l2_norm(action_parameters)
+        latent_norm = parameter_grad_l2_norm(latent_parameters)
+        backbone_norm = parameter_grad_l2_norm(backbone_parameters)
+
+        return {
+            "grad_norm_model_total": parameter_grad_l2_norm(all_parameters),
+            "grad_norm_shared": backbone_norm,
+            "grad_norm_action_head": action_norm,
+            "grad_norm_latent_head": latent_norm,
+            "grad_norm_backbone": backbone_norm,
+        }
+
     def _pi_aloha_decode_state(self, state):
         for motor_idx in [1, 2, 8, 9]:
             state[:, motor_idx] *= -1
@@ -1079,6 +1146,8 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
 
         metrics: dict[str, float | Tensor] = {}
         total = None
+        weighted_action: Tensor | None = None
+        weighted_latent: Tensor | None = None
         action_keep: Tensor | None = None
         latent_keep: Tensor | None = None
         latent_vector_labels: Tensor | None = None
@@ -1086,7 +1155,8 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         if self.config.training_mode in {"action", "multitask"}:
             action_loss, action_metrics, action_keep = self._forward_action_branch(batch, noise, time)
             metrics.update(action_metrics)
-            total = float(self.config.action_loss_weight) * action_loss
+            weighted_action = float(self.config.action_loss_weight) * action_loss
+            total = weighted_action
 
         if self.config.training_mode in {"latent", "multitask"}:
             if self.config.latent_head_mode == "index_cross_entropy":
@@ -1118,7 +1188,18 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
                 )
             )
 
-        metrics["loss"] = float(total.detach().cpu())
+        total_value = float(total.detach().cpu())
+        weighted_action_value = 0.0 if weighted_action is None else float(weighted_action.detach().cpu())
+        weighted_latent_value = 0.0 if weighted_latent is None else float(weighted_latent.detach().cpu())
+        metrics["loss"] = total_value
+        metrics["action_loss_weighted"] = weighted_action_value
+        metrics["latent_loss_weighted"] = weighted_latent_value
+        metrics["loss_weighted_action_fraction"] = (
+            weighted_action_value / total_value if total_value > 0.0 else 0.0
+        )
+        metrics["loss_weighted_latent_fraction"] = (
+            weighted_latent_value / total_value if total_value > 0.0 else 0.0
+        )
         metrics["mode_action"] = float(self.config.training_mode == "action")
         metrics["mode_latent"] = float(self.config.training_mode == "latent")
         metrics["mode_multitask"] = float(self.config.training_mode == "multitask")

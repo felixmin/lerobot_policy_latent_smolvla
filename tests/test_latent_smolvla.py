@@ -20,7 +20,11 @@ from lerobot_policy_latent_smolvla.loss_utils import (
     reduce_vector_flow_per_sample,
     reshape_latent_vector_sequence,
 )
-from lerobot_policy_latent_smolvla.modeling_latent_smolvla import LatentSmolVLAFlowMatching, LatentSmolVLAPolicy
+from lerobot_policy_latent_smolvla.modeling_latent_smolvla import (
+    LatentSmolVLAFlowMatching,
+    LatentSmolVLAPolicy,
+    parameter_grad_l2_norm,
+)
 from lerobot_policy_latent_smolvla.processor_latent_smolvla import (
     LatentSmolVLALatentTargetNormalizer,
     _make_batch_to_transition_with_latent_keys,
@@ -312,6 +316,47 @@ def test_policy_latent_keep_mask_supports_sequence_validity():
     )
 
 
+def test_parameter_grad_l2_norm_ignores_missing_grads():
+    first = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+    second = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+    first.grad = torch.tensor([3.0, 4.0], dtype=torch.float32)
+    second.grad = None
+
+    assert parameter_grad_l2_norm([first, second]) == 5.0
+
+
+def test_policy_get_gradient_metrics_splits_old_heads():
+    class DummyOldHeadModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.state_proj = nn.Linear(1, 1, bias=False)
+            self.action_in_proj = nn.Linear(1, 1, bias=False)
+            self.action_out_proj = nn.Linear(1, 1, bias=False)
+            self.action_time_mlp_in = nn.Linear(1, 1, bias=False)
+            self.action_time_mlp_out = nn.Linear(1, 1, bias=False)
+            self.latent_in_proj = nn.Linear(1, 1, bias=False)
+            self.latent_time_mlp_in = nn.Linear(1, 1, bias=False)
+            self.latent_time_mlp_out = nn.Linear(1, 1, bias=False)
+            self.latent_vector_out_proj = nn.Linear(1, 1, bias=False)
+
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(latent_head_mode="vector_diffusion")
+    policy.model = DummyOldHeadModel()
+
+    policy.model.action_in_proj.weight.grad = torch.tensor([[3.0]], dtype=torch.float32)
+    policy.model.latent_in_proj.weight.grad = torch.tensor([[4.0]], dtype=torch.float32)
+    policy.model.state_proj.weight.grad = torch.tensor([[12.0]], dtype=torch.float32)
+
+    metrics = policy.get_gradient_metrics()
+
+    assert metrics["grad_norm_action_head"] == pytest.approx(3.0)
+    assert metrics["grad_norm_latent_head"] == pytest.approx(4.0)
+    assert metrics["grad_norm_shared"] == pytest.approx(12.0)
+    assert metrics["grad_norm_backbone"] == pytest.approx(12.0)
+    assert metrics["grad_norm_model_total"] == pytest.approx(13.0)
+
+
 def test_policy_default_peft_targets_vector_mode_include_latent_vector_modules():
     policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
     policy.config = SimpleNamespace(latent_head_mode="vector_diffusion")
@@ -579,3 +624,35 @@ def test_forward_latent_diffusion_branch_reports_token_metrics():
     assert metrics["batch_latent_supervised_token_fraction"] == pytest.approx(4.0 / 6.0)
     assert torch.equal(keep, batch["latent_labels.valid"])
     assert torch.equal(labels, batch["latent_labels.continuous_vector_latents"])
+
+
+def test_policy_forward_reports_weighted_loss_metrics_for_old_heads():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        adapt_to_pi_aloha=False,
+        training_mode="multitask",
+        latent_head_mode="vector_diffusion",
+        action_loss_weight=2.0,
+        latent_loss_weight=0.5,
+    )
+    policy._forward_action_branch = lambda *args, **kwargs: (
+        torch.tensor(2.0),
+        {"action_loss": 2.0},
+        torch.tensor([True, False]),
+    )
+    policy._forward_latent_diffusion_branch = lambda *args, **kwargs: (
+        torch.tensor(4.0),
+        {"latent_loss": 4.0, "latent_head_mode_vector_diffusion": 1.0},
+        torch.tensor([[True, False, True], [False, True, True]]),
+        torch.zeros(2, 3, 4),
+    )
+    policy._compute_joint_vector_target_metrics = lambda *args, **kwargs: {}
+
+    total, metrics = policy.forward({"action": torch.zeros(2, 4, 6)})
+
+    assert float(total) == pytest.approx(6.0)
+    assert metrics["action_loss_weighted"] == pytest.approx(4.0)
+    assert metrics["latent_loss_weighted"] == pytest.approx(2.0)
+    assert metrics["loss_weighted_action_fraction"] == pytest.approx(4.0 / 6.0)
+    assert metrics["loss_weighted_latent_fraction"] == pytest.approx(2.0 / 6.0)
+    assert metrics["latent_head_mode_vector_diffusion"] == 1.0
