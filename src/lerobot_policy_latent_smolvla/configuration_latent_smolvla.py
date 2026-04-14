@@ -95,6 +95,7 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     latent_supervision_key: str | None = None
     action_supervision_key: str | None = None
     normalize_latent_targets: bool = True
+    latent_normalization_source: str = "latent"
     latent_normalization_eps: float = 1e-8
     latent_flow_beta_alpha: float = 1.5
     latent_flow_beta_beta: float = 1.0
@@ -122,6 +123,11 @@ class LatentSmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "latent_head_mode must be 'joint_diffusion', "
                 f"got {self.latent_head_mode!r}"
+            )
+        if self.latent_normalization_source not in {"latent", "action"}:
+            raise ValueError(
+                "latent_normalization_source must be one of {'latent', 'action'}, "
+                f"got {self.latent_normalization_source!r}"
             )
         if self.action_loss_weight < 0.0:
             raise ValueError(

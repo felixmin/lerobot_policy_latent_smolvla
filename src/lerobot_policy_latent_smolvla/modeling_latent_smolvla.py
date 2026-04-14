@@ -445,7 +445,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         self,
         joint_motion: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        latent_motion = joint_motion[..., : self.config.max_action_dim][..., : self.latent_step_dim]
+        latent_motion = joint_motion[..., : self.config.max_action_dim]
         action_motion = joint_motion[..., self.config.max_action_dim :]
         return latent_motion, action_motion
 
@@ -986,40 +986,50 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             noise=noise,
             time=time,
         )
-        per_sample_action = reduce_action_per_sample(
-            action_losses,
-            max_action_dim=self.config.max_action_dim,
-            action_is_pad=action_is_pad,
-        )
-        per_step_latent = latent_losses.mean(dim=-1)
-        batch_size = int(per_sample_action.shape[0])
+        batch_size = int(action_losses.shape[0])
         action_keep = (
             self._make_action_keep_mask(
                 batch,
                 batch_size=batch_size,
-                device=per_sample_action.device,
+                device=action_losses.device,
             )
             if self.config.training_mode in {"action", "multitask"}
-            else torch.zeros(batch_size, dtype=torch.bool, device=per_sample_action.device)
+            else torch.zeros(batch_size, dtype=torch.bool, device=action_losses.device)
         )
         latent_keep = (
             self._make_latent_keep_mask(
                 batch,
                 batch_size=batch_size,
-                sequence_length=int(per_step_latent.shape[1]),
-                device=per_step_latent.device,
+                sequence_length=int(latent_losses.shape[1]),
+                device=latent_losses.device,
             )
             if self.config.training_mode in {"latent", "multitask"}
             else torch.zeros(
                 batch_size,
-                int(per_step_latent.shape[1]),
+                int(latent_losses.shape[1]),
                 dtype=torch.bool,
-                device=per_step_latent.device,
+                device=latent_losses.device,
             )
         )
+        per_sample_action = reduce_action_per_sample(
+            action_losses,
+            max_action_dim=self.config.max_action_dim,
+            action_is_pad=action_is_pad,
+        )
+        latent_is_pad = ~latent_keep
+        if action_is_pad is not None:
+            latent_is_pad = latent_is_pad | action_is_pad.to(device=latent_is_pad.device, dtype=torch.bool)
+        per_sample_latent = reduce_action_per_sample(
+            latent_losses,
+            max_action_dim=self.config.max_action_dim,
+            action_is_pad=latent_is_pad,
+        )
+        per_step_latent = latent_losses.mean(dim=-1)
         action_loss, action_kept = masked_mean_or_zero(per_sample_action, action_keep)
-        latent_loss, latent_kept_tokens = masked_mean_or_zero(per_step_latent, latent_keep)
-        latent_kept_samples = int(latent_keep.any(dim=1).sum().item())
+        latent_sample_keep = latent_keep.any(dim=1)
+        latent_loss, _ = masked_mean_or_zero(per_sample_latent, latent_sample_keep)
+        latent_kept_samples = int(latent_sample_keep.sum().item())
+        latent_kept_tokens = int(latent_keep.sum().item())
 
         action_metrics = self._make_loss_metrics(
             branch_name="action",
@@ -1031,8 +1041,8 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             branch_name="latent",
             loss=latent_loss,
             kept=latent_kept_samples,
-            denominator=int(per_step_latent.shape[0]),
-            kept_exact=latent_kept_tokens,
+            denominator=int(per_sample_latent.shape[0]),
+            kept_exact=latent_kept_samples,
         )
         latent_metrics["batch_latent_supervised_tokens"] = float(latent_kept_tokens)
         latent_metrics["batch_latent_supervised_token_denominator"] = float(

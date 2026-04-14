@@ -37,12 +37,18 @@ def test_config_defaults():
     assert config.latent_label_key == "latent_labels.continuous_vector_latents"
     assert config.latent_valid_key == "latent_labels.valid"
     assert config.normalize_latent_targets is True
+    assert config.latent_normalization_source == "latent"
     assert config.latent_supervision_key is None
     assert config.action_supervision_key is None
     assert config.latent_code_seq_len == config.chunk_size
     assert not isinstance(config, SmolVLAConfig)
     assert isinstance(config.get_optimizer_preset(), AdamWConfig)
     assert isinstance(config.get_scheduler_preset(), CosineDecayWithWarmupSchedulerConfig)
+
+
+def test_config_rejects_invalid_latent_normalization_source():
+    with pytest.raises(ValueError, match="latent_normalization_source"):
+        LatentSmolVLAConfig(latent_normalization_source="prefer_action")
 
 
 def test_config_requires_matching_joint_horizon():
@@ -146,6 +152,85 @@ def test_latent_target_normalizer_supports_flat_labels_with_structured_stats():
         transformed[TransitionKey.COMPLEMENTARY_DATA]["latent_labels.continuous_vector_latents"],
         expected,
     )
+
+
+def test_latent_target_normalizer_defaults_to_latent_stats():
+    step = LatentSmolVLALatentTargetNormalizer(
+        latent_label_key="latent_labels.continuous_vector_latents",
+        stats={
+            "mean": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "std": torch.tensor([[2.0, 4.0], [5.0, 10.0]]),
+        },
+        action_stats={
+            "mean": torch.tensor([100.0, 200.0]),
+            "std": torch.tensor([10.0, 10.0]),
+        },
+    )
+    transition = {
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "latent_labels.continuous_vector_latents": torch.tensor(
+                [[[3.0, 6.0], [8.0, 14.0]]],
+                dtype=torch.float32,
+            )
+        }
+    }
+
+    transformed = step(transition)
+    expected = torch.tensor([[[1.0, 1.0], [1.0, 1.0]]], dtype=torch.float32)
+    assert torch.allclose(
+        transformed[TransitionKey.COMPLEMENTARY_DATA]["latent_labels.continuous_vector_latents"],
+        expected,
+    )
+
+
+def test_latent_target_normalizer_can_use_action_stats_for_action_like_labels():
+    step = LatentSmolVLALatentTargetNormalizer(
+        latent_label_key="latent_labels.continuous_vector_latents",
+        normalization_source="action",
+        stats={
+            "mean": torch.tensor([[100.0, 200.0], [300.0, 400.0]]),
+            "std": torch.tensor([[10.0, 10.0], [10.0, 10.0]]),
+        },
+        action_stats={
+            "mean": torch.tensor([1.0, 2.0]),
+            "std": torch.tensor([2.0, 4.0]),
+        },
+    )
+    transition = {
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "latent_labels.continuous_vector_latents": torch.tensor(
+                [[[3.0, 6.0], [5.0, 10.0]]],
+                dtype=torch.float32,
+            )
+        }
+    }
+
+    transformed = step(transition)
+    expected = torch.tensor([[[1.0, 1.0], [2.0, 2.0]]], dtype=torch.float32)
+    assert torch.allclose(
+        transformed[TransitionKey.COMPLEMENTARY_DATA]["latent_labels.continuous_vector_latents"],
+        expected,
+    )
+
+
+def test_latent_target_normalizer_action_source_raises_without_action_stats():
+    step = LatentSmolVLALatentTargetNormalizer(
+        latent_label_key="latent_labels.continuous_vector_latents",
+        normalization_source="action",
+        stats={
+            "mean": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "std": torch.tensor([[2.0, 4.0], [5.0, 10.0]]),
+        },
+        action_stats=None,
+    )
+    transition = {
+        TransitionKey.COMPLEMENTARY_DATA: {
+            "latent_labels.continuous_vector_latents": torch.ones(1, 2, 2, dtype=torch.float32)
+        }
+    }
+
+    with pytest.raises(ValueError, match="action stats are missing"):
+        step(transition)
 
 
 def test_latent_target_normalizer_raises_when_enabled_without_stats():
@@ -396,7 +481,7 @@ def test_forward_joint_motion_losses_returns_action_and_latent_shapes():
     )
 
     assert action_losses.shape == actions.shape
-    assert latent_losses.shape == latents.shape
+    assert latent_losses.shape == (2, 4, 6)
 
 
 def test_forward_joint_motion_losses_rejects_mismatched_latent_horizon():
@@ -447,3 +532,47 @@ def test_policy_forward_uses_joint_diffusion_branch():
     assert metrics["action_loss_weighted"] == 2.0
     assert metrics["latent_loss_weighted"] == 3.0
     assert metrics["latent_head_mode_joint_diffusion"] == 1.0
+
+
+def test_joint_diffusion_branch_aligns_action_and_latent_reduction():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        training_mode="multitask",
+        latent_label_key="latent_labels.continuous_vector_latents",
+        latent_valid_key="latent_labels.valid",
+        latent_supervision_key=None,
+        action_supervision_key=None,
+        max_action_dim=6,
+    )
+    policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
+    policy.prepare_state = lambda batch: torch.zeros(2, 6)
+    policy.model = SimpleNamespace(
+        forward_joint_motion_losses=lambda *args, **kwargs: (
+            torch.ones(2, 4, 6, dtype=torch.float32),
+            torch.ones(2, 4, 6, dtype=torch.float32),
+        )
+    )
+
+    batch = {
+        "action": torch.randn(2, 4, 6),
+        "action_is_pad": torch.tensor([[False, False, True, True], [False, False, False, True]]),
+        "latent_labels.continuous_vector_latents": torch.randn(2, 4, 4),
+        "latent_labels.valid": torch.tensor([[True, True, False, False], [True, True, True, False]]),
+        "observation.language.tokens": torch.zeros(2, 5, dtype=torch.long),
+        "observation.language.attention_mask": torch.ones(2, 5, dtype=torch.bool),
+    }
+
+    (
+        action_loss,
+        _action_metrics,
+        _action_keep,
+        latent_loss,
+        latent_metrics,
+        latent_keep,
+        _labels,
+    ) = policy._forward_joint_diffusion_branch(batch, noise=None, time=None)
+
+    assert float(action_loss) == pytest.approx(0.625)
+    assert float(latent_loss) == pytest.approx(0.625)
+    assert latent_metrics["batch_latent_supervised_tokens"] == 5.0
+    assert torch.equal(latent_keep, batch["latent_labels.valid"])

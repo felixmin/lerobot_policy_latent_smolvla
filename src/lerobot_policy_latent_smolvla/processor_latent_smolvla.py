@@ -20,7 +20,7 @@ from lerobot.processor import (
 )
 from lerobot.processor.converters import batch_to_transition, policy_action_to_transition, transition_to_policy_action
 from lerobot.types import TransitionKey
-from lerobot.utils.constants import POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import ACTION, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
 
 from lerobot_policy_latent_smolvla.configuration_latent_smolvla import LatentSmolVLAConfig
 
@@ -51,8 +51,10 @@ def make_latent_smolvla_pre_post_processors(
         LatentSmolVLALatentTargetNormalizer(
             latent_label_key=config.latent_label_key,
             enabled=bool(config.normalize_latent_targets),
+            normalization_source=str(config.latent_normalization_source),
             eps=float(config.latent_normalization_eps),
             stats=None if dataset_stats is None else dataset_stats.get(config.latent_label_key),
+            action_stats=None if dataset_stats is None else dataset_stats.get(ACTION),
         ),
     ]
     output_steps = [
@@ -137,14 +139,25 @@ class LatentSmolVLANewLineProcessor(ComplementaryDataProcessorStep):
 class LatentSmolVLALatentTargetNormalizer(ComplementaryDataProcessorStep):
     latent_label_key: str
     enabled: bool = True
+    normalization_source: str = "latent"
     eps: float = 1e-8
     stats: dict[str, Any] | None = None
+    action_stats: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        if self.normalization_source not in {"latent", "action"}:
+            raise ValueError(
+                "normalization_source must be one of {'latent', 'action'}, "
+                f"got {self.normalization_source!r}"
+            )
         self._mean: torch.Tensor | None = None
         self._std: torch.Tensor | None = None
+        self._action_mean: torch.Tensor | None = None
+        self._action_std: torch.Tensor | None = None
         if self.stats is not None:
             self._load_stats(self.stats)
+        if self.action_stats is not None:
+            self._load_action_stats(self.action_stats)
 
     def _load_stats(self, stats: dict[str, Any]) -> None:
         mean = stats.get("mean")
@@ -154,15 +167,23 @@ class LatentSmolVLALatentTargetNormalizer(ComplementaryDataProcessorStep):
         self._mean = torch.as_tensor(mean)
         self._std = torch.as_tensor(std)
 
-    def _normalize_latent_labels(self, latent_labels: torch.Tensor) -> torch.Tensor:
-        if self._mean is None or self._std is None:
-            raise ValueError(
-                f"Latent normalization is enabled, but stats are missing for {self.latent_label_key!r}."
-            )
+    def _load_action_stats(self, stats: dict[str, Any]) -> None:
+        mean = stats.get("mean")
+        std = stats.get("std")
+        if mean is None or std is None:
+            return
+        self._action_mean = torch.as_tensor(mean)
+        self._action_std = torch.as_tensor(std)
 
-        mean = self._mean.to(device=latent_labels.device, dtype=latent_labels.dtype)
-        std = self._std.to(device=latent_labels.device, dtype=latent_labels.dtype)
-
+    def _normalize_with_stats(
+        self,
+        latent_labels: torch.Tensor,
+        *,
+        mean: torch.Tensor,
+        std: torch.Tensor,
+    ) -> torch.Tensor:
+        mean = mean.to(device=latent_labels.device, dtype=latent_labels.dtype)
+        std = std.to(device=latent_labels.device, dtype=latent_labels.dtype)
         if latent_labels.shape[-mean.ndim :] == mean.shape:
             return (latent_labels - mean) / (std + float(self.eps))
 
@@ -193,6 +214,29 @@ class LatentSmolVLALatentTargetNormalizer(ComplementaryDataProcessorStep):
             f"labels={tuple(latent_labels.shape)} stats={tuple(mean.shape)}"
         )
 
+    def _normalize_latent_labels(self, latent_labels: torch.Tensor) -> torch.Tensor:
+        if self.normalization_source == "action":
+            if self._action_mean is None or self._action_std is None:
+                raise ValueError(
+                    "Latent normalization is configured to use action stats, "
+                    f"but action stats are missing for {ACTION!r}."
+                )
+            return self._normalize_with_stats(
+                latent_labels,
+                mean=self._action_mean,
+                std=self._action_std,
+            )
+
+        if self._mean is None or self._std is None:
+            raise ValueError(
+                f"Latent normalization is enabled, but stats are missing for {self.latent_label_key!r}."
+            )
+        return self._normalize_with_stats(
+            latent_labels,
+            mean=self._mean,
+            std=self._std,
+        )
+
     def complementary_data(self, complementary_data):
         if not self.enabled:
             return complementary_data
@@ -213,17 +257,25 @@ class LatentSmolVLALatentTargetNormalizer(ComplementaryDataProcessorStep):
         return {
             "latent_label_key": self.latent_label_key,
             "enabled": self.enabled,
+            "normalization_source": self.normalization_source,
             "eps": self.eps,
         }
 
     def state_dict(self) -> dict[str, torch.Tensor]:
-        if self._mean is None or self._std is None:
-            return {}
-        return {"mean": self._mean, "std": self._std}
+        state: dict[str, torch.Tensor] = {}
+        if self._mean is not None and self._std is not None:
+            state["mean"] = self._mean
+            state["std"] = self._std
+        if self._action_mean is not None and self._action_std is not None:
+            state["action_mean"] = self._action_mean
+            state["action_std"] = self._action_std
+        return state
 
     def load_state_dict(self, state: dict[str, torch.Tensor]) -> None:
         self._mean = state.get("mean")
         self._std = state.get("std")
+        self._action_mean = state.get("action_mean")
+        self._action_std = state.get("action_std")
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
