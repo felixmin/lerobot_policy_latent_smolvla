@@ -187,16 +187,16 @@ class LatentSmolVLAFlowMatching(nn.Module):
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
-        self.joint_motion_in_proj = nn.Linear(
+        self.joint_motion_in_proj = nn.Linear( # TODO lets separate these to have latent in proj and action in proj
             2 * self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size
         )
-        self.joint_motion_out_proj = nn.Linear(
+        self.joint_motion_out_proj = nn.Linear( # TODO lets separate these to have latent out proj and action out proj
             self.vlm_with_expert.expert_hidden_size, 2 * self.config.max_action_dim
         )
-        self.joint_motion_time_mlp_in = nn.Linear(
+        self.joint_motion_time_mlp_in = nn.Linear( # TODO lets separate these to have latent time mlp in and action time mlp in
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
         )
-        self.joint_motion_time_mlp_out = nn.Linear(
+        self.joint_motion_time_mlp_out = nn.Linear( # TODO lets separate these to have latent time mlp out and action time mlp out
             self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
         )
         self.latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
@@ -410,7 +410,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
             )
         return target_seq
 
-    def _prepare_action_targets(
+    def _prepare_action_targets( # TODO remove all these helpers
         self,
         actions: torch.Tensor | None,
         *,
@@ -487,7 +487,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         batch_size = int(state.shape[0])
         device = state.device
         dtype = torch.float32
-        action_targets = self._prepare_action_targets(
+        action_targets = self._prepare_action_targets( # TODO remove all these helpers
             actions,
             batch_size=batch_size,
             device=device,
@@ -520,7 +520,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks, state=state
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
-        suffix_out = self._forward_suffix_hidden(
+        suffix_out = self._forward_suffix_hidden( # TODO remove this helper function and put the code directly here, like in plain smolvla
             prefix_embs=prefix_embs,
             prefix_pad_masks=prefix_pad_masks,
             prefix_att_masks=prefix_att_masks,
@@ -530,13 +530,13 @@ class LatentSmolVLAFlowMatching(nn.Module):
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
         v_t = self.joint_motion_out_proj(suffix_out)
-        latent_u_t, action_u_t = self._split_joint_motion(u_t)
+        latent_u_t, action_u_t = self._split_joint_motion(u_t) # TODO check if we can simplify without helper
         latent_v_t, action_v_t = self._split_joint_motion(v_t)
         action_losses = F.mse_loss(action_u_t, action_v_t, reduction="none")
         latent_losses = F.mse_loss(latent_u_t, latent_v_t, reduction="none")
         return action_losses, latent_losses
 
-    def forward(
+    def forward( # TODO remove this helper function and put the code directly here, like in plain smolvla
         self,
         images,
         img_masks,

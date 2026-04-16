@@ -98,7 +98,7 @@ def reduce_action_per_sample(
     return losses.mean(dim=(1, 2))
 
 
-def reduce_latent_per_sample(
+def reduce_latent_per_sample( # TODO why is this so different comapred to action branch?
     logits: torch.Tensor,
     labels: torch.Tensor,
     *,
