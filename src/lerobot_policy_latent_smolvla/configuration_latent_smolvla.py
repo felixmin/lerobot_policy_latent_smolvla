@@ -80,18 +80,16 @@ class LatentSmolVLAConfig(PreTrainedConfig):
 
     # Latent supervision.
     training_mode: str = "multitask"
-    latent_head_mode: str = "joint_diffusion"
+    latent_head_mode: str = "vector_diffusion"
     action_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
 
-    latent_codebook_size: int = 8
     latent_code_seq_len: int = 50
     latent_vector_dim: int = 1600
     # Keep latent-related batch keys outside observation.* so dataset delta-timestamp
     # expansion does not add extra observation-history axes.
     latent_label_key: str = "latent_labels.continuous_vector_latents"
     latent_valid_key: str | None = "latent_labels.valid"
-    latent_ignore_index: int = -100
     latent_supervision_key: str | None = None
     action_supervision_key: str | None = None
     normalize_latent_targets: bool = True
@@ -119,9 +117,9 @@ class LatentSmolVLAConfig(PreTrainedConfig):
                 "training_mode must be one of {'action', 'latent', 'multitask'}, "
                 f"got {self.training_mode!r}"
             )
-        if self.latent_head_mode != "joint_diffusion":
+        if self.latent_head_mode != "vector_diffusion":
             raise ValueError(
-                "latent_head_mode must be 'joint_diffusion', "
+                "latent_head_mode must be 'vector_diffusion', "
                 f"got {self.latent_head_mode!r}"
             )
         if self.latent_normalization_source not in {"latent", "action"}:
@@ -136,10 +134,6 @@ class LatentSmolVLAConfig(PreTrainedConfig):
         if self.latent_loss_weight < 0.0:
             raise ValueError(
                 f"latent_loss_weight must be >= 0, got {self.latent_loss_weight}"
-            )
-        if self.latent_codebook_size < 2:
-            raise ValueError(
-                f"latent_codebook_size must be >= 2, got {self.latent_codebook_size}"
             )
         if self.latent_code_seq_len < 1:
             raise ValueError(

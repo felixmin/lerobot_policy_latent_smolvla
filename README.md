@@ -13,7 +13,6 @@ The installable package name is `lerobot_policy_latent_smolvla`.
 
 - one packed joint diffusion head over `[latent | action]`
 - `training_mode` options: `action`, `latent`, or `multitask`
-- `latent_head_mode=joint_diffusion`
 - latent target routing through `latent_label_key` with default `latent_labels.continuous_vector_latents`
 - latent target validity through `latent_valid_key` with default `latent_labels.valid`
 - optional per-sample branch routing through `latent_supervision_key` and `action_supervision_key`
@@ -46,7 +45,6 @@ lerobot-train \
   --policy.type=latent_smolvla \
   --dataset.repo_id=HuggingFaceVLA/libero \
   --policy.training_mode=multitask \
-  --policy.latent_head_mode=joint_diffusion \
   --policy.latent_label_key=latent_labels.continuous_vector_latents \
   --policy.latent_valid_key=latent_labels.valid \
   --policy.latent_supervision_key=latent_supervision \
@@ -58,7 +56,6 @@ lerobot-train \
 ## Important Config Knobs
 
 - `policy.training_mode` is still a run-level switch. Use `multitask` when a batch may contain both action-supervised and latent-supervised samples.
-- `policy.latent_head_mode=joint_diffusion` is the only supported mode and expects continuous latent vectors.
 - Packed joint diffusion requires `latent_code_seq_len == chunk_size`.
 - Each latent step must fit within `max_action_dim`; the model pads the latent half to `max_action_dim` before concatenating `[latent | action]`.
 - `policy.latent_valid_key` should indicate whether the latent target is usable for a sample.

@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F  # noqa: N812
 
 
 def pool_hidden(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -98,47 +97,6 @@ def reduce_action_per_sample(
     return losses.mean(dim=(1, 2))
 
 
-def reduce_latent_per_sample( # TODO why is this so different comapred to action branch?
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    ignore_index: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if labels.ndim == 1 and logits.ndim == 3 and logits.shape[1] == 1:
-        labels = labels.unsqueeze(1)
-    if labels.ndim != 2:
-        raise ValueError(f"Expected latent labels with shape [B, S], got {tuple(labels.shape)}")
-    if logits.ndim != 3:
-        raise ValueError(f"Expected latent logits with shape [B, S, K], got {tuple(logits.shape)}")
-    if logits.shape[:2] != labels.shape:
-        raise ValueError(
-            f"Latent logits/labels shape mismatch: logits={tuple(logits.shape)}, labels={tuple(labels.shape)}"
-        )
-
-    valid_tokens = labels.ne(ignore_index)
-    flat_loss = F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
-        labels.reshape(-1),
-        ignore_index=ignore_index,
-        reduction="none",
-    ).reshape_as(labels)
-    flat_loss = flat_loss * valid_tokens
-
-    valid_counts = valid_tokens.sum(dim=1)
-    per_sample_loss = flat_loss.sum(dim=1) / valid_counts.clamp(min=1)
-
-    preds = logits.argmax(dim=-1)
-    correct = (preds == labels) & valid_tokens
-    per_sample_acc = correct.sum(dim=1).float() / valid_counts.clamp(min=1).float()
-
-    probs = F.softmax(logits, dim=-1)
-    pred_probs = probs.gather(-1, preds.unsqueeze(-1)).squeeze(-1) * valid_tokens
-    per_sample_conf = pred_probs.sum(dim=1) / valid_counts.clamp(min=1).float()
-
-    valid_samples = valid_counts.gt(0)
-    return per_sample_loss, valid_samples, per_sample_acc, per_sample_conf
-
-
 def reshape_latent_vector_sequence(
     vectors: torch.Tensor,
     *,
@@ -176,21 +134,6 @@ def sample_beta_time(
     beta_dist = torch.distributions.Beta(concentration1=alpha, concentration0=beta)
     time_beta = beta_dist.sample((batch_size,)).to(device=device, dtype=dtype)
     return time_beta * 0.999 + 0.001
-
-
-def reduce_vector_flow_per_sample(
-    predicted_velocity: torch.Tensor,
-    target_velocity: torch.Tensor,
-) -> torch.Tensor:
-    if predicted_velocity.shape != target_velocity.shape:
-        raise ValueError(
-            "Vector flow tensors must have identical shape, "
-            f"got predicted={tuple(predicted_velocity.shape)} target={tuple(target_velocity.shape)}"
-        )
-    losses = F.mse_loss(predicted_velocity, target_velocity, reduction="none")
-    return losses.mean(dim=tuple(range(1, losses.ndim)))
-
-
 def masked_mean_or_zero(values: torch.Tensor, keep: torch.Tensor) -> tuple[torch.Tensor, int]:
     kept = int(keep.bool().sum().item())
     if kept > 0:

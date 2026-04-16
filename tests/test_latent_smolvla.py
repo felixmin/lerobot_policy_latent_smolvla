@@ -33,7 +33,7 @@ from lerobot_policy_latent_smolvla.processor_latent_smolvla import (
 def test_config_defaults():
     config = LatentSmolVLAConfig()
     assert config.training_mode == "multitask"
-    assert config.latent_head_mode == "joint_diffusion"
+    assert config.latent_head_mode == "vector_diffusion"
     assert config.latent_label_key == "latent_labels.continuous_vector_latents"
     assert config.latent_valid_key == "latent_labels.valid"
     assert config.normalize_latent_targets is True
@@ -385,20 +385,23 @@ def test_reshape_latent_vector_sequence_from_flat():
     assert torch.equal(seq.reshape(2, 12), vectors)
 
 
-def test_policy_default_peft_targets_use_joint_motion_modules():
+def test_policy_default_peft_targets_use_vector_diffusion_modules():
     policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
-    policy.config = SimpleNamespace(latent_head_mode="joint_diffusion")
 
     targets = policy._get_default_peft_targets()
 
-    assert "joint_motion_in_proj" in targets["target_modules"]
-    assert "joint_motion_time_mlp_in" in targets["target_modules"]
-    assert "joint_motion_time_mlp_out" in targets["target_modules"]
-    assert "joint_motion_out_proj" in targets["target_modules"]
+    assert "action_in_proj" in targets["target_modules"]
+    assert "action_time_mlp_in" in targets["target_modules"]
+    assert "action_time_mlp_out" in targets["target_modules"]
+    assert "action_out_proj" in targets["target_modules"]
+    assert "latent_in_proj" in targets["target_modules"]
+    assert "latent_time_mlp_in" in targets["target_modules"]
+    assert "latent_time_mlp_out" in targets["target_modules"]
+    assert "latent_out_proj" in targets["target_modules"]
     assert targets["modules_to_save"] == []
 
 
-def test_model_forward_returns_unreduced_action_losses_shape():
+def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
     model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
@@ -409,7 +412,8 @@ def test_model_forward_returns_unreduced_action_losses_shape():
     )
     model.latent_step_dim = 4
     model.joint_motion_dim = 12
-    model.joint_motion_out_proj = nn.Linear(7, 12)
+    model.action_out_proj = nn.Linear(7, 6)
+    model.latent_out_proj = nn.Linear(7, 6)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.embed_prefix = lambda *args, **kwargs: (
@@ -422,11 +426,19 @@ def test_model_forward_returns_unreduced_action_losses_shape():
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
     )
-    model._forward_suffix_hidden = lambda **kwargs: torch.ones_like(kwargs["suffix_embs"])
+
+    def fake_forward(**kwargs):
+        prefix_embs, suffix_embs = kwargs["inputs_embeds"]
+        assert prefix_embs is not None
+        assert suffix_embs is not None
+        assert kwargs["fill_kv_cache"] is False
+        return ([prefix_embs, torch.ones_like(suffix_embs)], None)
+
+    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
 
     actions = torch.randn(2, 4, 6)
     latent_vectors = torch.randn(2, 4, 4)
-    losses = model.forward(
+    action_losses, latent_losses = model.forward(
         None,
         None,
         None,
@@ -437,10 +449,11 @@ def test_model_forward_returns_unreduced_action_losses_shape():
         noise=torch.zeros(2, 4, 12),
         time=torch.full((2,), 0.5),
     )
-    assert losses.shape == actions.shape
+    assert action_losses.shape == actions.shape
+    assert latent_losses.shape == actions.shape
 
 
-def test_forward_joint_motion_losses_returns_action_and_latent_shapes():
+def test_model_forward_returns_action_and_latent_shapes():
     model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
@@ -451,7 +464,8 @@ def test_forward_joint_motion_losses_returns_action_and_latent_shapes():
     )
     model.latent_step_dim = 4
     model.joint_motion_dim = 12
-    model.joint_motion_out_proj = nn.Linear(7, 12)
+    model.action_out_proj = nn.Linear(7, 6)
+    model.latent_out_proj = nn.Linear(7, 6)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.embed_prefix = lambda *args, **kwargs: (
@@ -464,11 +478,19 @@ def test_forward_joint_motion_losses_returns_action_and_latent_shapes():
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
     )
-    model._forward_suffix_hidden = lambda **kwargs: torch.ones_like(kwargs["suffix_embs"])
+
+    def fake_forward(**kwargs):
+        prefix_embs, suffix_embs = kwargs["inputs_embeds"]
+        assert prefix_embs is not None
+        assert suffix_embs is not None
+        assert kwargs["fill_kv_cache"] is False
+        return ([prefix_embs, torch.ones_like(suffix_embs)], None)
+
+    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
 
     actions = torch.randn(2, 4, 6)
     latents = torch.randn(2, 4, 4)
-    action_losses, latent_losses = model.forward_joint_motion_losses(
+    action_losses, latent_losses = model.forward(
         None,
         None,
         None,
@@ -484,7 +506,7 @@ def test_forward_joint_motion_losses_returns_action_and_latent_shapes():
     assert latent_losses.shape == (2, 4, 6)
 
 
-def test_forward_joint_motion_losses_rejects_mismatched_latent_horizon():
+def test_model_forward_rejects_mismatched_latent_horizon():
     model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
@@ -494,50 +516,101 @@ def test_forward_joint_motion_losses_rejects_mismatched_latent_horizon():
         latent_vector_dim=16,
     )
     model.latent_step_dim = 4
+    model.joint_motion_dim = 12
+    model.action_out_proj = nn.Linear(7, 6)
+    model.latent_out_proj = nn.Linear(7, 6)
+    model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
+    model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(2, 4, 7),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(2, 4, dtype=torch.bool),
+    )
+    model.embed_suffix = lambda noisy_motion, timestep: (
+        torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
+    )
+
+    def fake_forward(**kwargs):
+        prefix_embs, suffix_embs = kwargs["inputs_embeds"]
+        assert prefix_embs is not None
+        assert suffix_embs is not None
+        assert kwargs["fill_kv_cache"] is False
+        return ([prefix_embs, torch.ones_like(suffix_embs)], None)
+
+    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
 
     with pytest.raises(ValueError, match=r"Expected latent vector tensor \[B,4,4\]"):
-        model._prepare_latent_targets(
+        model.forward(
+            None,
+            None,
+            None,
+            None,
+            torch.zeros(2, 6),
+            torch.randn(2, 4, 6),
             torch.randn(2, 3, 4),
-            batch_size=2,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
+            noise=torch.zeros(2, 4, 12),
+            time=torch.full((2,), 0.5),
         )
 
 
-def test_policy_forward_uses_joint_diffusion_branch():
+def test_policy_forward_combines_action_and_latent_losses():
+    class DummyModel:
+        def __call__(self, *args, **kwargs):
+            return (
+                torch.full((2, 4, 6), 2.0, dtype=torch.float32),
+                torch.full((2, 4, 6), 3.0, dtype=torch.float32),
+            )
+
     policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
     policy.config = SimpleNamespace(
         adapt_to_pi_aloha=False,
         training_mode="multitask",
         action_loss_weight=1.0,
         latent_loss_weight=1.0,
+        latent_label_key="latent_labels.continuous_vector_latents",
+        latent_valid_key="latent_labels.valid",
+        latent_supervision_key=None,
+        action_supervision_key=None,
+        max_action_dim=6,
     )
     policy._compute_joint_vector_target_metrics = lambda *args, **kwargs: {}
-    policy._forward_joint_diffusion_branch = lambda *args, **kwargs: (
-        torch.tensor(2.0),
-        {"action_loss": 2.0},
-        torch.tensor([True, False]),
-        torch.tensor(3.0),
-        {
-            "latent_loss": 3.0,
-            "latent_head_mode_joint_diffusion": 1.0,
-        },
-        torch.tensor([False, True]),
-        torch.zeros(2, 4, 4),
-    )
+    policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
+    policy.prepare_state = lambda batch: torch.zeros(2, 6)
+    policy.model = DummyModel()
 
-    total, metrics = policy.forward({"action": torch.zeros(2, 4, 6)})
+    total, metrics = policy.forward(
+        {
+            "action": torch.zeros(2, 4, 6),
+            "latent_labels.continuous_vector_latents": torch.zeros(2, 4, 4),
+            "latent_labels.valid": torch.ones(2, 4, dtype=torch.bool),
+            "observation.language.tokens": torch.zeros(2, 5, dtype=torch.long),
+            "observation.language.attention_mask": torch.ones(2, 5, dtype=torch.bool),
+        }
+    )
 
     assert float(total) == 5.0
     assert metrics["action_loss_weighted"] == 2.0
     assert metrics["latent_loss_weighted"] == 3.0
-    assert metrics["latent_head_mode_joint_diffusion"] == 1.0
+    assert metrics["action_loss"] == 2.0
+    assert metrics["latent_loss"] == 3.0
 
 
-def test_joint_diffusion_branch_aligns_action_and_latent_reduction():
+def test_policy_forward_aligns_action_and_latent_reduction():
+    class DummyModel:
+        def __call__(self, *args, **kwargs):
+            return (
+                torch.ones(2, 4, 6, dtype=torch.float32),
+                torch.ones(2, 4, 6, dtype=torch.float32),
+            )
+
     policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
     policy.config = SimpleNamespace(
+        adapt_to_pi_aloha=False,
         training_mode="multitask",
+        action_loss_weight=1.0,
+        latent_loss_weight=1.0,
         latent_label_key="latent_labels.continuous_vector_latents",
         latent_valid_key="latent_labels.valid",
         latent_supervision_key=None,
@@ -546,12 +619,7 @@ def test_joint_diffusion_branch_aligns_action_and_latent_reduction():
     )
     policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
     policy.prepare_state = lambda batch: torch.zeros(2, 6)
-    policy.model = SimpleNamespace(
-        forward_joint_motion_losses=lambda *args, **kwargs: (
-            torch.ones(2, 4, 6, dtype=torch.float32),
-            torch.ones(2, 4, 6, dtype=torch.float32),
-        )
-    )
+    policy.model = DummyModel()
 
     batch = {
         "action": torch.randn(2, 4, 6),
@@ -562,17 +630,11 @@ def test_joint_diffusion_branch_aligns_action_and_latent_reduction():
         "observation.language.attention_mask": torch.ones(2, 5, dtype=torch.bool),
     }
 
-    (
-        action_loss,
-        _action_metrics,
-        _action_keep,
-        latent_loss,
-        latent_metrics,
-        latent_keep,
-        _labels,
-    ) = policy._forward_joint_diffusion_branch(batch, noise=None, time=None)
+    policy._compute_joint_vector_target_metrics = lambda *args, **kwargs: {}
 
-    assert float(action_loss) == pytest.approx(0.625)
-    assert float(latent_loss) == pytest.approx(0.625)
-    assert latent_metrics["batch_latent_supervised_tokens"] == 5.0
-    assert torch.equal(latent_keep, batch["latent_labels.valid"])
+    total, metrics = policy.forward(batch, noise=None, time=None)
+
+    assert float(total) == pytest.approx(1.25)
+    assert metrics["action_loss"] == pytest.approx(0.625)
+    assert metrics["latent_loss"] == pytest.approx(0.625)
+    assert metrics["batch_latent_supervised_tokens"] == 5.0
