@@ -390,14 +390,10 @@ def test_policy_default_peft_targets_use_vector_diffusion_modules():
 
     targets = policy._get_default_peft_targets()
 
-    assert "action_in_proj" in targets["target_modules"]
-    assert "action_time_mlp_in" in targets["target_modules"]
-    assert "action_time_mlp_out" in targets["target_modules"]
-    assert "action_out_proj" in targets["target_modules"]
-    assert "latent_in_proj" in targets["target_modules"]
-    assert "latent_time_mlp_in" in targets["target_modules"]
-    assert "latent_time_mlp_out" in targets["target_modules"]
-    assert "latent_out_proj" in targets["target_modules"]
+    assert "joint_in_proj" in targets["target_modules"]
+    assert "joint_time_mlp_in" in targets["target_modules"]
+    assert "joint_time_mlp_out" in targets["target_modules"]
+    assert "joint_out_proj" in targets["target_modules"]
     assert targets["modules_to_save"] == []
 
 
@@ -412,8 +408,7 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
     )
     model.latent_step_dim = 4
     model.joint_motion_dim = 12
-    model.action_out_proj = nn.Linear(7, 6)
-    model.latent_out_proj = nn.Linear(7, 6)
+    model.joint_out_proj = nn.Linear(7, 12)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.embed_prefix = lambda *args, **kwargs: (
@@ -464,8 +459,7 @@ def test_model_forward_returns_action_and_latent_shapes():
     )
     model.latent_step_dim = 4
     model.joint_motion_dim = 12
-    model.action_out_proj = nn.Linear(7, 6)
-    model.latent_out_proj = nn.Linear(7, 6)
+    model.joint_out_proj = nn.Linear(7, 12)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.embed_prefix = lambda *args, **kwargs: (
@@ -517,8 +511,7 @@ def test_model_forward_rejects_mismatched_latent_horizon():
     )
     model.latent_step_dim = 4
     model.joint_motion_dim = 12
-    model.action_out_proj = nn.Linear(7, 6)
-    model.latent_out_proj = nn.Linear(7, 6)
+    model.joint_out_proj = nn.Linear(7, 12)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.embed_prefix = lambda *args, **kwargs: (

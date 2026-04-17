@@ -187,32 +187,20 @@ class LatentSmolVLAFlowMatching(nn.Module):
         self.state_proj = nn.Linear(
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
-        self.action_in_proj = nn.Linear(
-            self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size
-        )
-        self.latent_in_proj = nn.Linear(
-            self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size
-        )
-        self.action_out_proj = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim
-        )
-        self.latent_out_proj = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim
-        )
-        self.action_time_mlp_in = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
-        )
-        self.latent_time_mlp_in = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
-        )
-        self.action_time_mlp_out = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
-        )
-        self.latent_time_mlp_out = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
-        )
         self.latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
         self.joint_motion_dim = 2 * int(config.max_action_dim)
+        self.joint_in_proj = nn.Linear(
+            self.joint_motion_dim, self.vlm_with_expert.expert_hidden_size
+        )
+        self.joint_out_proj = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size, self.joint_motion_dim
+        )
+        self.joint_time_mlp_in = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
+        )
+        self.joint_time_mlp_out = nn.Linear(
+            self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
+        )
 
         self.set_requires_grad()
         self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
@@ -339,13 +327,10 @@ class LatentSmolVLAFlowMatching(nn.Module):
                 "Expected packed joint motion suffix with shape [B, S, 2 * max_action_dim], "
                 f"got {tuple(noisy_motion.shape)}"
             )
-        latent_motion = noisy_motion[..., : self.config.max_action_dim]
-        action_motion = noisy_motion[..., self.config.max_action_dim :]
-        latent_emb = self.latent_in_proj(latent_motion)
-        action_emb = self.action_in_proj(action_motion)
-        device = latent_emb.device
-        batch_size = latent_emb.shape[0]
-        dtype = latent_emb.dtype
+        motion_emb = self.joint_in_proj(noisy_motion)
+        device = motion_emb.device
+        batch_size = motion_emb.shape[0]
+        dtype = motion_emb.dtype
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.vlm_with_expert.expert_hidden_size,
@@ -353,19 +338,12 @@ class LatentSmolVLAFlowMatching(nn.Module):
             self.config.max_period,
             device=device,
         ).to(dtype=dtype)
-        time_emb = time_emb[:, None, :].expand_as(latent_emb)
+        time_emb = time_emb[:, None, :].expand_as(motion_emb)
 
-        latent_time_emb = torch.cat([latent_emb, time_emb], dim=2)
-        latent_time_emb = self.latent_time_mlp_in(latent_time_emb)
-        latent_time_emb = F.silu(latent_time_emb)
-        latent_time_emb = self.latent_time_mlp_out(latent_time_emb)
-
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
-        action_time_emb = self.action_time_mlp_in(action_time_emb)
-        action_time_emb = F.silu(action_time_emb)
-        action_time_emb = self.action_time_mlp_out(action_time_emb)
-
-        motion_time_emb = latent_time_emb + action_time_emb
+        motion_time_emb = torch.cat([motion_emb, time_emb], dim=2)
+        motion_time_emb = self.joint_time_mlp_in(motion_time_emb)
+        motion_time_emb = F.silu(motion_time_emb)
+        motion_time_emb = self.joint_time_mlp_out(motion_time_emb)
 
         pad_masks = torch.ones(
             batch_size, motion_time_emb.shape[1], dtype=torch.bool, device=device
@@ -481,8 +459,9 @@ class LatentSmolVLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :].to(dtype=torch.float32)
-        latent_v_t = self.latent_out_proj(suffix_out)
-        action_v_t = self.action_out_proj(suffix_out)
+        joint_v_t = self.joint_out_proj(suffix_out)
+        latent_v_t = joint_v_t[..., : self.config.max_action_dim]
+        action_v_t = joint_v_t[..., self.config.max_action_dim :]
         latent_u_t = u_t[..., : self.config.max_action_dim]
         action_u_t = u_t[..., self.config.max_action_dim :]
         action_losses = F.mse_loss(action_u_t, action_v_t, reduction="none")
@@ -585,9 +564,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = outputs_embeds[1][:, -self.config.chunk_size :].to(dtype=torch.float32)
-        latent_v_t = self.latent_out_proj(suffix_out)
-        action_v_t = self.action_out_proj(suffix_out)
-        return torch.cat([latent_v_t, action_v_t], dim=-1)
+        return self.joint_out_proj(suffix_out)
 
 
 class LatentSmolVLAPolicy(PreTrainedPolicy):
@@ -794,21 +771,14 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         return metrics
 
     def get_gradient_metrics(self) -> dict[str, float]:
-        action_prefixes = (
-            "model.action_in_proj",
-            "model.action_out_proj",
-            "model.action_time_mlp_in",
-            "model.action_time_mlp_out",
-        )
-        latent_prefixes = (
-            "model.latent_in_proj",
-            "model.latent_out_proj",
-            "model.latent_time_mlp_in",
-            "model.latent_time_mlp_out",
+        joint_prefixes = (
+            "model.joint_in_proj",
+            "model.joint_out_proj",
+            "model.joint_time_mlp_in",
+            "model.joint_time_mlp_out",
         )
 
-        action_parameters: list[nn.Parameter] = []
-        latent_parameters: list[nn.Parameter] = []
+        joint_parameters: list[nn.Parameter] = []
         backbone_parameters: list[nn.Parameter] = []
         all_parameters: list[nn.Parameter] = []
 
@@ -816,24 +786,20 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             if not parameter.requires_grad:
                 continue
             all_parameters.append(parameter)
-            if name.startswith(action_prefixes):
-                action_parameters.append(parameter)
-            elif name.startswith(latent_prefixes):
-                latent_parameters.append(parameter)
+            if name.startswith(joint_prefixes):
+                joint_parameters.append(parameter)
             else:
                 backbone_parameters.append(parameter)
 
-        action_norm = parameter_grad_l2_norm(action_parameters)
-        latent_norm = parameter_grad_l2_norm(latent_parameters)
+        joint_norm = parameter_grad_l2_norm(joint_parameters)
         backbone_norm = parameter_grad_l2_norm(backbone_parameters)
 
         return {
             "grad_norm_model_total": parameter_grad_l2_norm(all_parameters),
             "grad_norm_shared": backbone_norm,
-            "grad_norm_action_head": action_norm,
-            "grad_norm_latent_head": latent_norm,
+            "grad_norm_joint_head": joint_norm,
             "grad_norm_backbone": backbone_norm,
-            "grad_norm_joint_motion": parameter_grad_l2_norm(action_parameters + latent_parameters),
+            "grad_norm_joint_motion": joint_norm,
         }
 
     def _pi_aloha_decode_state(self, state):
@@ -1072,14 +1038,10 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
     def _get_default_peft_targets(self) -> dict[str, any]:
         common_projections = [
             "state_proj",
-            "action_in_proj",
-            "action_out_proj",
-            "action_time_mlp_in",
-            "action_time_mlp_out",
-            "latent_in_proj",
-            "latent_out_proj",
-            "latent_time_mlp_in",
-            "latent_time_mlp_out",
+            "joint_in_proj",
+            "joint_out_proj",
+            "joint_time_mlp_in",
+            "joint_time_mlp_out",
         ]
         common_projection_pattern = "|".join(common_projections)
         target_modules = (
