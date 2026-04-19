@@ -26,9 +26,10 @@ class LatentSmolVLAConfig(PreTrainedConfig):
         }
     )
 
-    # Shorter state and action vectors will be padded.
+    # Shorter state, action, and latent vectors will be padded.
     max_state_dim: int = 32
     max_action_dim: int = 32
+    max_latent_dim: int | None = None
 
     # Image preprocessing.
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
@@ -89,8 +90,10 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     latent_teacher_force_ratio_start: float = 1.0
     latent_teacher_force_ratio_end: float = 0.0
     latent_teacher_force_decay_steps: int = 100_000
-    # Keep latent-related batch keys outside observation.* so dataset delta-timestamp
-    # expansion does not add extra observation-history axes.
+    # Keep latent-related batch keys outside observation.* and route them explicitly
+    # through latent_delta_indices so they can use future timestamp access without
+    # sharing observation_delta_indices.
+    latent_delta_indices: list[int] | None = None
     latent_label_key: str = "latent_labels.continuous_vector_latents"
     latent_valid_key: str | None = "latent_labels.valid"
     latent_supervision_key: str | None = None
@@ -103,6 +106,9 @@ class LatentSmolVLAConfig(PreTrainedConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+        if self.max_latent_dim is None:
+            self.max_latent_dim = int(self.max_action_dim)
 
         if self.n_action_steps > self.chunk_size:
             raise ValueError(
@@ -146,17 +152,30 @@ class LatentSmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"latent_vector_dim must be >= 1, got {self.latent_vector_dim}"
             )
+        if self.max_latent_dim < 1:
+            raise ValueError(
+                f"max_latent_dim must be >= 1, got {self.max_latent_dim}"
+            )
         if self.latent_vector_dim % self.latent_code_seq_len != 0:
             raise ValueError(
                 "latent_vector_dim must be divisible by latent_code_seq_len, "
                 f"got latent_vector_dim={self.latent_vector_dim} "
                 f"latent_code_seq_len={self.latent_code_seq_len}"
             )
-        latent_step_dim = self.latent_vector_dim // self.latent_code_seq_len
-        if latent_step_dim > self.max_action_dim:
+        if (
+            self.latent_delta_indices is not None
+            and len(self.latent_delta_indices) != int(self.latent_code_seq_len)
+        ):
             raise ValueError(
-                "Hierarchical latent diffusion requires latent step dim <= max_action_dim, "
-                f"got latent_step_dim={latent_step_dim} max_action_dim={self.max_action_dim}"
+                "latent_delta_indices must have length latent_code_seq_len, "
+                f"got len(latent_delta_indices)={len(self.latent_delta_indices)} "
+                f"latent_code_seq_len={self.latent_code_seq_len}"
+            )
+        latent_step_dim = self.latent_vector_dim // self.latent_code_seq_len
+        if latent_step_dim > self.max_latent_dim:
+            raise ValueError(
+                "Hierarchical latent diffusion requires latent step dim <= max_latent_dim, "
+                f"got latent_step_dim={latent_step_dim} max_latent_dim={self.max_latent_dim}"
             )
         if self.latent_flow_beta_alpha <= 0.0 or self.latent_flow_beta_beta <= 0.0:
             raise ValueError(

@@ -62,15 +62,39 @@ def test_config_allows_shorter_latent_horizon_than_action_horizon():
     assert config.latent_code_seq_len == 4
 
 
-def test_config_requires_latent_step_dim_to_fit_action_pad_dim():
-    with pytest.raises(ValueError, match="latent step dim <= max_action_dim"):
+def test_config_rejects_mismatched_latent_delta_indices_length():
+    with pytest.raises(ValueError, match="latent_delta_indices must have length latent_code_seq_len"):
+        LatentSmolVLAConfig(
+            chunk_size=6,
+            n_action_steps=6,
+            latent_code_seq_len=4,
+            latent_vector_dim=24,
+            latent_delta_indices=[0, 10, 20],
+        )
+
+
+def test_config_requires_latent_step_dim_to_fit_latent_pad_dim():
+    with pytest.raises(ValueError, match="latent step dim <= max_latent_dim"):
         LatentSmolVLAConfig(
             chunk_size=4,
             n_action_steps=4,
             latent_code_seq_len=4,
             latent_vector_dim=28,
-            max_action_dim=6,
+            max_latent_dim=6,
         )
+
+
+def test_config_allows_latent_step_dim_to_exceed_action_pad_dim_when_latent_pad_dim_is_larger():
+    config = LatentSmolVLAConfig(
+        chunk_size=4,
+        n_action_steps=4,
+        latent_code_seq_len=4,
+        latent_vector_dim=28,
+        max_action_dim=6,
+        max_latent_dim=8,
+    )
+    assert config.max_action_dim == 6
+    assert config.max_latent_dim == 8
 
 
 def test_preserve_configured_latent_and_supervision_keys():
@@ -366,6 +390,30 @@ def test_policy_latent_keep_mask_supports_sequence_validity():
     )
 
 
+def test_policy_latent_keep_mask_intersects_valid_samples():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        latent_valid_key="latent_labels.valid",
+        latent_supervision_key=None,
+    )
+    keep = policy._make_latent_keep_mask(
+        {
+            "latent_labels.valid": torch.tensor([[True, True, True], [True, True, True]]),
+        },
+        batch_size=2,
+        sequence_length=3,
+        device=torch.device("cpu"),
+        valid_samples=torch.tensor([[True, False, True], [False, True, False]]),
+    )
+    assert torch.equal(
+        keep,
+        torch.tensor(
+            [[True, False, True], [False, True, False]],
+            dtype=torch.bool,
+        ),
+    )
+
+
 def test_parameter_grad_l2_norm_ignores_missing_grads():
     first = nn.Parameter(torch.zeros(2, dtype=torch.float32))
     second = nn.Parameter(torch.zeros(2, dtype=torch.float32))
@@ -404,11 +452,13 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
     model.config = SimpleNamespace(
         chunk_size=4,
         max_action_dim=6,
+        max_latent_dim=6,
         latent_code_seq_len=4,
         latent_vector_dim=16,
         latent_teacher_force_ratio_end=0.0,
     )
     model.latent_step_dim = 4
+    model.max_latent_dim = 6
     model.latent_out_proj = nn.Linear(7, 6)
     model.action_out_proj = nn.Linear(7, 6)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
@@ -460,11 +510,13 @@ def test_model_forward_returns_action_and_latent_shapes():
     model.config = SimpleNamespace(
         chunk_size=4,
         max_action_dim=6,
+        max_latent_dim=6,
         latent_code_seq_len=4,
         latent_vector_dim=16,
         latent_teacher_force_ratio_end=0.0,
     )
     model.latent_step_dim = 4
+    model.max_latent_dim = 6
     model.latent_out_proj = nn.Linear(7, 6)
     model.action_out_proj = nn.Linear(7, 6)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
@@ -517,11 +569,13 @@ def test_model_forward_rejects_mismatched_latent_horizon():
     model.config = SimpleNamespace(
         chunk_size=4,
         max_action_dim=6,
+        max_latent_dim=6,
         latent_code_seq_len=4,
         latent_vector_dim=16,
         latent_teacher_force_ratio_end=0.0,
     )
     model.latent_step_dim = 4
+    model.max_latent_dim = 6
     model.latent_out_proj = nn.Linear(7, 6)
     model.action_out_proj = nn.Linear(7, 6)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
@@ -647,3 +701,53 @@ def test_policy_forward_aligns_action_and_latent_reduction():
     assert metrics["action_loss"] == pytest.approx(0.625)
     assert metrics["latent_loss"] == pytest.approx(0.625)
     assert metrics["batch_latent_supervised_tokens"] == 5.0
+
+
+def test_policy_forward_combines_latent_validity_with_dataset_padding():
+    class DummyModel:
+        def __call__(self, *args, **kwargs):
+            self.kwargs = kwargs
+            return (
+                torch.ones(2, 4, 6, dtype=torch.float32),
+                torch.ones(2, 4, 6, dtype=torch.float32),
+            )
+
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        adapt_to_pi_aloha=False,
+        training_mode="multitask",
+        action_loss_weight=1.0,
+        latent_loss_weight=1.0,
+        latent_label_key="latent_labels.continuous_vector_latents",
+        latent_valid_key="latent_labels.valid",
+        latent_supervision_key=None,
+        action_supervision_key=None,
+        max_action_dim=6,
+        latent_code_seq_len=4,
+    )
+    policy._compute_joint_vector_target_metrics = lambda *args, **kwargs: {}
+    policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
+    policy.prepare_state = lambda batch: torch.zeros(2, 6)
+    policy.model = DummyModel()
+
+    batch = {
+        "action": torch.randn(2, 4, 6),
+        "latent_labels.continuous_vector_latents": torch.randn(2, 4, 4),
+        "latent_labels.continuous_vector_latents_is_pad": torch.tensor(
+            [[False, True, False, False], [False, False, True, True]]
+        ),
+        "latent_labels.valid": torch.tensor([[True, True, True, False], [True, True, True, True]]),
+        "observation.language.tokens": torch.zeros(2, 5, dtype=torch.long),
+        "observation.language.attention_mask": torch.ones(2, 5, dtype=torch.bool),
+    }
+
+    total, metrics = policy.forward(batch)
+
+    expected_keep = torch.tensor(
+        [[True, False, True, False], [True, True, False, False]],
+        dtype=torch.bool,
+    )
+    assert torch.equal(policy.model.kwargs["latent_valid"], expected_keep)
+    assert float(total) == pytest.approx(1.5)
+    assert metrics["latent_loss"] == pytest.approx(0.5)
+    assert metrics["batch_latent_supervised_tokens"] == 4.0

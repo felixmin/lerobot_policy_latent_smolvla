@@ -88,12 +88,12 @@ def expand_keep_mask(values: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
 def reduce_action_per_sample(
     losses: torch.Tensor,
     *,
-    max_action_dim: int,
+    feature_dim: int,
     action_is_pad: torch.Tensor | None,
 ) -> torch.Tensor:
     if action_is_pad is not None:
         losses = losses * (~action_is_pad).unsqueeze(-1)
-    losses = losses[:, :, :max_action_dim]
+    losses = losses[:, :, :feature_dim]
     return losses.mean(dim=(1, 2))
 
 

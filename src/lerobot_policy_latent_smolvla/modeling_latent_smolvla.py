@@ -202,11 +202,14 @@ class LatentSmolVLAFlowMatching(nn.Module):
             self.config.max_state_dim, self.latent_vlm_with_expert.config.text_config.hidden_size
         )
         self.latent_step_dim = int(config.latent_vector_dim) // int(config.latent_code_seq_len)
+        self.max_latent_dim = int(
+            getattr(config, "max_latent_dim", config.max_action_dim)
+        )
         self.prefix_hidden_size = self.latent_vlm_with_expert.config.text_config.hidden_size
         self.expert_hidden_size = self.latent_vlm_with_expert.expert_hidden_size
 
-        self.latent_in_proj = nn.Linear(self.config.max_action_dim, self.expert_hidden_size)
-        self.latent_out_proj = nn.Linear(self.expert_hidden_size, self.config.max_action_dim)
+        self.latent_in_proj = nn.Linear(self.max_latent_dim, self.expert_hidden_size)
+        self.latent_out_proj = nn.Linear(self.expert_hidden_size, self.max_latent_dim)
         self.latent_time_mlp_in = nn.Linear(self.expert_hidden_size * 2, self.expert_hidden_size)
         self.latent_time_mlp_out = nn.Linear(self.expert_hidden_size, self.expert_hidden_size)
 
@@ -215,7 +218,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         self.action_time_mlp_in = nn.Linear(self.expert_hidden_size * 2, self.expert_hidden_size)
         self.action_time_mlp_out = nn.Linear(self.expert_hidden_size, self.expert_hidden_size)
 
-        self.latent_plan_proj = nn.Linear(self.config.max_action_dim, self.prefix_hidden_size)
+        self.latent_plan_proj = nn.Linear(self.max_latent_dim, self.prefix_hidden_size)
         self.latent_anchor_mlp_in = nn.Linear(1, self.prefix_hidden_size)
         self.latent_anchor_mlp_out = nn.Linear(self.prefix_hidden_size, self.prefix_hidden_size)
         self.latent_duration_mlp_in = nn.Linear(1, self.prefix_hidden_size)
@@ -406,10 +409,11 @@ class LatentSmolVLAFlowMatching(nn.Module):
         *,
         batch_size: int,
         sequence_length: int,
+        feature_dim: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        shape = (batch_size, sequence_length, self.config.max_action_dim)
+        shape = (batch_size, sequence_length, feature_dim)
         if noise is None:
             return self.sample_noise(shape, device)
         noise = noise.to(device=device, dtype=dtype)
@@ -553,13 +557,13 @@ class LatentSmolVLAFlowMatching(nn.Module):
                 latent_vector_dim=int(self.config.latent_vector_dim),
             ).to(device=device, dtype=dtype)
             latent_targets = torch.nan_to_num(latent_targets, nan=0.0, posinf=0.0, neginf=0.0)
-            if int(latent_targets.shape[2]) > int(self.config.max_action_dim):
+            if int(latent_targets.shape[2]) > int(self.max_latent_dim):
                 raise ValueError(
-                    "Hierarchical latent diffusion requires latent step dim <= max_action_dim, "
-                    f"got latent_step_dim={latent_targets.shape[2]} max_action_dim={self.config.max_action_dim}"
+                    "Hierarchical latent diffusion requires latent step dim <= max_latent_dim, "
+                    f"got latent_step_dim={latent_targets.shape[2]} max_latent_dim={self.max_latent_dim}"
                 )
-        if int(latent_targets.shape[-1]) != int(self.config.max_action_dim):
-            latent_targets = pad_vector(latent_targets, self.config.max_action_dim)
+        if int(latent_targets.shape[-1]) != int(self.max_latent_dim):
+            latent_targets = pad_vector(latent_targets, self.max_latent_dim)
 
         latent_noise_input, action_noise_input = self.split_noise(noise)
         latent_time, action_time = self.split_time(time)
@@ -568,6 +572,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
             latent_noise_input,
             batch_size=batch_size,
             sequence_length=self.config.latent_code_seq_len,
+            feature_dim=self.max_latent_dim,
             device=device,
             dtype=dtype,
         )
@@ -575,6 +580,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
             action_noise_input,
             batch_size=batch_size,
             sequence_length=self.config.chunk_size,
+            feature_dim=self.config.max_action_dim,
             device=device,
             dtype=dtype,
         )
@@ -671,6 +677,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
             latent_noise_input,
             batch_size=batch_size,
             sequence_length=self.config.latent_code_seq_len,
+            feature_dim=self.max_latent_dim,
             device=device,
             dtype=torch.float32,
         )
@@ -678,6 +685,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
             action_noise_input,
             batch_size=batch_size,
             sequence_length=self.config.chunk_size,
+            feature_dim=self.config.max_action_dim,
             device=device,
             dtype=torch.float32,
         )
@@ -1117,11 +1125,52 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+        batch_device = state.device if state is not None else lang_tokens.device
         latent_vector_labels = (
-            batch[latent_key].to(device=state.device, dtype=torch.float32)
+            batch[latent_key].to(device=batch_device, dtype=torch.float32)
             if latent_key in batch
             else None
         )
+        batch_size = int(lang_tokens.shape[0])
+        latent_sequence_length = int(getattr(self.config, "latent_code_seq_len", 1))
+        if latent_vector_labels is not None and latent_vector_labels.ndim == 3:
+            latent_sequence_length = int(latent_vector_labels.shape[1])
+        elif self.config.latent_valid_key and self.config.latent_valid_key in batch:
+            latent_valid_values = batch[self.config.latent_valid_key]
+            if torch.is_tensor(latent_valid_values) and latent_valid_values.ndim == 2:
+                latent_sequence_length = int(latent_valid_values.shape[1])
+
+        latent_valid = None
+        if self.config.latent_valid_key and self.config.latent_valid_key in batch:
+            latent_valid = make_sequence_keep_mask(
+                batch,
+                key=self.config.latent_valid_key,
+                batch_size=batch_size,
+                sequence_length=latent_sequence_length,
+                device=lang_tokens.device,
+            )
+        latent_is_pad_key = f"{latent_key}_is_pad"
+        if latent_is_pad_key in batch:
+            latent_not_pad_values = batch[latent_is_pad_key]
+            if torch.is_tensor(latent_not_pad_values):
+                latent_not_pad_values = ~latent_not_pad_values.to(
+                    device=lang_tokens.device,
+                    dtype=torch.bool,
+                )
+            else:
+                latent_not_pad_values = ~torch.as_tensor(
+                    latent_not_pad_values,
+                    device=lang_tokens.device,
+                    dtype=torch.bool,
+                )
+            latent_not_pad = make_sequence_keep_mask(
+                {latent_is_pad_key: latent_not_pad_values},
+                key=latent_is_pad_key,
+                batch_size=batch_size,
+                sequence_length=latent_sequence_length,
+                device=lang_tokens.device,
+            )
+            latent_valid = latent_not_pad if latent_valid is None else latent_valid & latent_not_pad
         actions = self.prepare_action(batch) if ACTION in batch else None
         action_is_pad = batch.get("action_is_pad")
         action_losses, latent_losses = self.model(
@@ -1132,7 +1181,7 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             state,
             actions,
             latent_vector_labels,
-            latent_valid=batch.get(self.config.latent_valid_key) if self.config.latent_valid_key else None,
+            latent_valid=latent_valid,
             noise=noise,
             time=time,
         )
@@ -1152,6 +1201,7 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
                 batch_size=batch_size,
                 sequence_length=int(latent_losses.shape[1]),
                 device=latent_losses.device,
+                valid_samples=latent_valid,
             )
             if self.config.training_mode in {"latent", "multitask"}
             else torch.zeros(
@@ -1164,7 +1214,7 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
 
         per_sample_action = reduce_action_per_sample(
             action_losses,
-            max_action_dim=self.config.max_action_dim,
+            feature_dim=self.config.max_action_dim,
             action_is_pad=action_is_pad,
         )
         latent_is_pad = ~latent_keep
@@ -1172,7 +1222,11 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             latent_is_pad = latent_is_pad | action_is_pad.to(device=latent_is_pad.device, dtype=torch.bool)
         per_sample_latent = reduce_action_per_sample(
             latent_losses,
-            max_action_dim=self.config.max_action_dim,
+            feature_dim=getattr(
+                self.model,
+                "max_latent_dim",
+                getattr(self.config, "max_latent_dim", self.config.max_action_dim),
+            ),
             action_is_pad=latent_is_pad,
         )
         action_loss, action_kept = masked_mean_or_zero(per_sample_action, action_keep)
