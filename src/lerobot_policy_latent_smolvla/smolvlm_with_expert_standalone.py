@@ -71,9 +71,14 @@ class SmolVLMWithExpertModel(nn.Module):
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
         device: str = "auto",
+        shared_vlm: nn.Module | None = None,
+        shared_processor=None,
     ):
         super().__init__()
-        if load_vlm_weights:
+        if shared_vlm is not None:
+            self.vlm = shared_vlm
+            config = self.vlm.config
+        elif load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
@@ -84,7 +89,7 @@ class SmolVLMWithExpertModel(nn.Module):
         else:
             config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.processor = shared_processor if shared_processor is not None else AutoProcessor.from_pretrained(model_id)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]

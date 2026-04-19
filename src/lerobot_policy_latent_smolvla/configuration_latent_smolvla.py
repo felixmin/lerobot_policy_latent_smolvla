@@ -11,7 +11,7 @@ from lerobot.utils.constants import OBS_IMAGES
 @PreTrainedConfig.register_subclass("latent_smolvla")
 @dataclass
 class LatentSmolVLAConfig(PreTrainedConfig):
-    """Standalone SmolVLA variant with packed joint latent/action diffusion."""
+    """Standalone SmolVLA variant with hierarchical latent-plan and action diffusion."""
 
     # Input / output structure.
     n_obs_steps: int = 1
@@ -86,6 +86,9 @@ class LatentSmolVLAConfig(PreTrainedConfig):
 
     latent_code_seq_len: int = 50
     latent_vector_dim: int = 1600
+    latent_teacher_force_ratio_start: float = 1.0
+    latent_teacher_force_ratio_end: float = 0.0
+    latent_teacher_force_decay_steps: int = 100_000
     # Keep latent-related batch keys outside observation.* so dataset delta-timestamp
     # expansion does not add extra observation-history axes.
     latent_label_key: str = "latent_labels.continuous_vector_latents"
@@ -143,11 +146,6 @@ class LatentSmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"latent_vector_dim must be >= 1, got {self.latent_vector_dim}"
             )
-        if self.latent_code_seq_len != self.chunk_size:
-            raise ValueError(
-                "Packed joint diffusion requires latent_code_seq_len == chunk_size, "
-                f"got latent_code_seq_len={self.latent_code_seq_len} chunk_size={self.chunk_size}"
-            )
         if self.latent_vector_dim % self.latent_code_seq_len != 0:
             raise ValueError(
                 "latent_vector_dim must be divisible by latent_code_seq_len, "
@@ -157,12 +155,27 @@ class LatentSmolVLAConfig(PreTrainedConfig):
         latent_step_dim = self.latent_vector_dim // self.latent_code_seq_len
         if latent_step_dim > self.max_action_dim:
             raise ValueError(
-                "Packed joint diffusion requires latent step dim <= max_action_dim, "
+                "Hierarchical latent diffusion requires latent step dim <= max_action_dim, "
                 f"got latent_step_dim={latent_step_dim} max_action_dim={self.max_action_dim}"
             )
         if self.latent_flow_beta_alpha <= 0.0 or self.latent_flow_beta_beta <= 0.0:
             raise ValueError(
                 "latent_flow_beta_alpha and latent_flow_beta_beta must both be > 0"
+            )
+        if not 0.0 <= self.latent_teacher_force_ratio_start <= 1.0:
+            raise ValueError(
+                "latent_teacher_force_ratio_start must be in [0, 1], "
+                f"got {self.latent_teacher_force_ratio_start}"
+            )
+        if not 0.0 <= self.latent_teacher_force_ratio_end <= 1.0:
+            raise ValueError(
+                "latent_teacher_force_ratio_end must be in [0, 1], "
+                f"got {self.latent_teacher_force_ratio_end}"
+            )
+        if self.latent_teacher_force_decay_steps < 0:
+            raise ValueError(
+                "latent_teacher_force_decay_steps must be >= 0, "
+                f"got {self.latent_teacher_force_decay_steps}"
             )
         if self.training_mode in {"action", "multitask"} and self.action_loss_weight == 0.0:
             raise ValueError(

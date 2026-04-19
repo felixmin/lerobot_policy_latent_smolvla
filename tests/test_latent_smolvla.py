@@ -51,14 +51,15 @@ def test_config_rejects_invalid_latent_normalization_source():
         LatentSmolVLAConfig(latent_normalization_source="prefer_action")
 
 
-def test_config_requires_matching_joint_horizon():
-    with pytest.raises(ValueError, match="latent_code_seq_len == chunk_size"):
-        LatentSmolVLAConfig(
-            chunk_size=6,
-            n_action_steps=6,
-            latent_code_seq_len=4,
-            latent_vector_dim=24,
-        )
+def test_config_allows_shorter_latent_horizon_than_action_horizon():
+    config = LatentSmolVLAConfig(
+        chunk_size=6,
+        n_action_steps=6,
+        latent_code_seq_len=4,
+        latent_vector_dim=24,
+    )
+    assert config.chunk_size == 6
+    assert config.latent_code_seq_len == 4
 
 
 def test_config_requires_latent_step_dim_to_fit_action_pad_dim():
@@ -390,10 +391,10 @@ def test_policy_default_peft_targets_use_vector_diffusion_modules():
 
     targets = policy._get_default_peft_targets()
 
-    assert "joint_in_proj" in targets["target_modules"]
-    assert "joint_time_mlp_in" in targets["target_modules"]
-    assert "joint_time_mlp_out" in targets["target_modules"]
-    assert "joint_out_proj" in targets["target_modules"]
+    assert "latent_in_proj" in targets["target_modules"]
+    assert "latent_plan_proj" in targets["target_modules"]
+    assert "action_in_proj" in targets["target_modules"]
+    assert "action_out_proj" in targets["target_modules"]
     assert targets["modules_to_save"] == []
 
 
@@ -405,10 +406,11 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
         max_action_dim=6,
         latent_code_seq_len=4,
         latent_vector_dim=16,
+        latent_teacher_force_ratio_end=0.0,
     )
     model.latent_step_dim = 4
-    model.joint_motion_dim = 12
-    model.joint_out_proj = nn.Linear(7, 12)
+    model.latent_out_proj = nn.Linear(7, 6)
+    model.action_out_proj = nn.Linear(7, 6)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.embed_prefix = lambda *args, **kwargs: (
@@ -416,20 +418,24 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
         torch.ones(2, 3, dtype=torch.bool),
         torch.zeros(2, 3, dtype=torch.bool),
     )
-    model.embed_suffix = lambda noisy_motion, timestep: (
+    model.embed_latent_suffix = lambda noisy_motion, timestep: (
         torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
     )
-
-    def fake_forward(**kwargs):
-        prefix_embs, suffix_embs = kwargs["inputs_embeds"]
-        assert prefix_embs is not None
-        assert suffix_embs is not None
-        assert kwargs["fill_kv_cache"] is False
-        return ([prefix_embs, torch.ones_like(suffix_embs)], None)
-
-    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
+    model.embed_action_suffix = lambda noisy_motion, timestep: (
+        torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
+    )
+    model.embed_latent_plan = lambda latent_plan, latent_valid=None, action_horizon=4: (
+        torch.zeros(latent_plan.shape[0], latent_plan.shape[1], 7),
+        torch.ones(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+        torch.zeros(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+    )
+    model.latent_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.action_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.eval()
 
     actions = torch.randn(2, 4, 6)
     latent_vectors = torch.randn(2, 4, 4)
@@ -441,7 +447,7 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
         torch.zeros(2, 6),
         actions,
         latent_vectors=latent_vectors,
-        noise=torch.zeros(2, 4, 12),
+        noise=(torch.zeros(2, 4, 6), torch.zeros(2, 4, 6)),
         time=torch.full((2,), 0.5),
     )
     assert action_losses.shape == actions.shape
@@ -456,10 +462,11 @@ def test_model_forward_returns_action_and_latent_shapes():
         max_action_dim=6,
         latent_code_seq_len=4,
         latent_vector_dim=16,
+        latent_teacher_force_ratio_end=0.0,
     )
     model.latent_step_dim = 4
-    model.joint_motion_dim = 12
-    model.joint_out_proj = nn.Linear(7, 12)
+    model.latent_out_proj = nn.Linear(7, 6)
+    model.action_out_proj = nn.Linear(7, 6)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.embed_prefix = lambda *args, **kwargs: (
@@ -467,20 +474,24 @@ def test_model_forward_returns_action_and_latent_shapes():
         torch.ones(2, 4, dtype=torch.bool),
         torch.zeros(2, 4, dtype=torch.bool),
     )
-    model.embed_suffix = lambda noisy_motion, timestep: (
+    model.embed_latent_suffix = lambda noisy_motion, timestep: (
         torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
     )
-
-    def fake_forward(**kwargs):
-        prefix_embs, suffix_embs = kwargs["inputs_embeds"]
-        assert prefix_embs is not None
-        assert suffix_embs is not None
-        assert kwargs["fill_kv_cache"] is False
-        return ([prefix_embs, torch.ones_like(suffix_embs)], None)
-
-    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
+    model.embed_action_suffix = lambda noisy_motion, timestep: (
+        torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
+    )
+    model.embed_latent_plan = lambda latent_plan, latent_valid=None, action_horizon=4: (
+        torch.zeros(latent_plan.shape[0], latent_plan.shape[1], 7),
+        torch.ones(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+        torch.zeros(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+    )
+    model.latent_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.action_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.eval()
 
     actions = torch.randn(2, 4, 6)
     latents = torch.randn(2, 4, 4)
@@ -492,7 +503,7 @@ def test_model_forward_returns_action_and_latent_shapes():
         torch.zeros(2, 6),
         actions,
         latents,
-        noise=torch.zeros(2, 4, 12),
+        noise=(torch.zeros(2, 4, 6), torch.zeros(2, 4, 6)),
         time=torch.full((2,), 0.5),
     )
 
@@ -508,10 +519,11 @@ def test_model_forward_rejects_mismatched_latent_horizon():
         max_action_dim=6,
         latent_code_seq_len=4,
         latent_vector_dim=16,
+        latent_teacher_force_ratio_end=0.0,
     )
     model.latent_step_dim = 4
-    model.joint_motion_dim = 12
-    model.joint_out_proj = nn.Linear(7, 12)
+    model.latent_out_proj = nn.Linear(7, 6)
+    model.action_out_proj = nn.Linear(7, 6)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.embed_prefix = lambda *args, **kwargs: (
@@ -519,20 +531,24 @@ def test_model_forward_rejects_mismatched_latent_horizon():
         torch.ones(2, 4, dtype=torch.bool),
         torch.zeros(2, 4, dtype=torch.bool),
     )
-    model.embed_suffix = lambda noisy_motion, timestep: (
+    model.embed_latent_suffix = lambda noisy_motion, timestep: (
         torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
     )
-
-    def fake_forward(**kwargs):
-        prefix_embs, suffix_embs = kwargs["inputs_embeds"]
-        assert prefix_embs is not None
-        assert suffix_embs is not None
-        assert kwargs["fill_kv_cache"] is False
-        return ([prefix_embs, torch.ones_like(suffix_embs)], None)
-
-    model.vlm_with_expert = SimpleNamespace(forward=fake_forward)
+    model.embed_action_suffix = lambda noisy_motion, timestep: (
+        torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
+    )
+    model.embed_latent_plan = lambda latent_plan, latent_valid=None, action_horizon=4: (
+        torch.zeros(latent_plan.shape[0], latent_plan.shape[1], 7),
+        torch.ones(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+        torch.zeros(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+    )
+    model.latent_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.action_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.eval()
 
     with pytest.raises(ValueError, match=r"Expected latent vector tensor \[B,4,4\]"):
         model.forward(
@@ -543,7 +559,7 @@ def test_model_forward_rejects_mismatched_latent_horizon():
             torch.zeros(2, 6),
             torch.randn(2, 4, 6),
             torch.randn(2, 3, 4),
-            noise=torch.zeros(2, 4, 12),
+            noise=(torch.zeros(2, 4, 6), torch.zeros(2, 4, 6)),
             time=torch.full((2,), 0.5),
         )
 
