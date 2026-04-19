@@ -85,8 +85,6 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     action_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
 
-    latent_code_seq_len: int = 50
-    latent_vector_dim: int = 1600
     latent_teacher_force_ratio_start: float = 1.0
     latent_teacher_force_ratio_end: float = 0.0
     latent_teacher_force_decay_steps: int = 100_000
@@ -144,38 +142,17 @@ class LatentSmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"latent_loss_weight must be >= 0, got {self.latent_loss_weight}"
             )
-        if self.latent_code_seq_len < 1:
-            raise ValueError(
-                f"latent_code_seq_len must be >= 1, got {self.latent_code_seq_len}"
-            )
-        if self.latent_vector_dim < 1:
-            raise ValueError(
-                f"latent_vector_dim must be >= 1, got {self.latent_vector_dim}"
-            )
         if self.max_latent_dim < 1:
             raise ValueError(
                 f"max_latent_dim must be >= 1, got {self.max_latent_dim}"
             )
-        if self.latent_vector_dim % self.latent_code_seq_len != 0:
-            raise ValueError(
-                "latent_vector_dim must be divisible by latent_code_seq_len, "
-                f"got latent_vector_dim={self.latent_vector_dim} "
-                f"latent_code_seq_len={self.latent_code_seq_len}"
-            )
         if (
             self.latent_delta_indices is not None
-            and len(self.latent_delta_indices) != int(self.latent_code_seq_len)
+            and len(self.latent_delta_indices) < 1
         ):
             raise ValueError(
-                "latent_delta_indices must have length latent_code_seq_len, "
-                f"got len(latent_delta_indices)={len(self.latent_delta_indices)} "
-                f"latent_code_seq_len={self.latent_code_seq_len}"
-            )
-        latent_step_dim = self.latent_vector_dim // self.latent_code_seq_len
-        if latent_step_dim > self.max_latent_dim:
-            raise ValueError(
-                "Hierarchical latent diffusion requires latent step dim <= max_latent_dim, "
-                f"got latent_step_dim={latent_step_dim} max_latent_dim={self.max_latent_dim}"
+                "latent_delta_indices must be non-empty when provided, "
+                f"got {self.latent_delta_indices}"
             )
         if self.latent_flow_beta_alpha <= 0.0 or self.latent_flow_beta_beta <= 0.0:
             raise ValueError(
@@ -243,3 +220,9 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     @property
     def reward_delta_indices(self) -> None:
         return None
+
+    @property
+    def latent_sequence_length(self) -> int:
+        if self.latent_delta_indices is not None:
+            return len(self.latent_delta_indices)
+        return self.chunk_size

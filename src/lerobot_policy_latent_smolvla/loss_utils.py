@@ -59,8 +59,10 @@ def make_sequence_keep_mask(
             return mask.expand(batch_size, sequence_length)
         if int(mask.shape[1]) == int(sequence_length):
             return mask
+    if mask.ndim == 3 and int(mask.shape[1]) == int(sequence_length) and int(mask.shape[2]) == 1:
+        return mask.squeeze(-1)
     raise ValueError(
-        "Expected sequence keep mask shaped [B], [B,1], or [B,S], "
+        "Expected sequence keep mask shaped [B], [B,1], [B,S], or [B,S,1], "
         f"got {tuple(mask.shape)} for key {key!r} and S={sequence_length}"
     )
 
@@ -100,27 +102,32 @@ def reduce_action_per_sample(
 def reshape_latent_vector_sequence(
     vectors: torch.Tensor,
     *,
-    latent_code_seq_len: int,
-    latent_vector_dim: int,
+    latent_sequence_length: int | None = None,
 ) -> torch.Tensor:
     if vectors.ndim == 2:
-        if int(vectors.shape[1]) != int(latent_vector_dim):
+        if latent_sequence_length is None:
             raise ValueError(
-                "Expected latent vector tensor [B, latent_vector_dim], "
-                f"got shape {tuple(vectors.shape)} and latent_vector_dim={latent_vector_dim}"
+                "Flat latent vectors require latent_sequence_length to reshape [B, D] into [B, S, D_token]."
             )
-        latent_step_dim = int(latent_vector_dim) // int(latent_code_seq_len)
-        return vectors.reshape(vectors.shape[0], int(latent_code_seq_len), latent_step_dim)
-    if vectors.ndim == 3:
-        latent_step_dim = int(latent_vector_dim) // int(latent_code_seq_len)
-        expected = (int(latent_code_seq_len), latent_step_dim)
-        got = (int(vectors.shape[1]), int(vectors.shape[2]))
-        if got != expected:
+        if int(vectors.shape[1]) % int(latent_sequence_length) != 0:
             raise ValueError(
-                f"Expected latent vector tensor [B,{expected[0]},{expected[1]}], got {tuple(vectors.shape)}"
+                "Expected flat latent vector tensor [B, S*D_token] with total width divisible by latent_sequence_length, "
+                f"got shape {tuple(vectors.shape)} and latent_sequence_length={latent_sequence_length}"
             )
-        return vectors
-    raise ValueError(f"Expected latent vectors rank 2 or 3, got rank={vectors.ndim}")
+        latent_step_dim = int(vectors.shape[1]) // int(latent_sequence_length)
+        return vectors.reshape(vectors.shape[0], int(latent_sequence_length), latent_step_dim)
+    if vectors.ndim >= 3:
+        if latent_sequence_length is not None and int(vectors.shape[1]) != int(latent_sequence_length):
+            raise ValueError(
+                f"Expected latent vector tensor with sequence length {latent_sequence_length}, got shape {tuple(vectors.shape)}"
+            )
+        batch_size = int(vectors.shape[0])
+        sequence_length = int(vectors.shape[1])
+        latent_step_dim = 1
+        for dim in vectors.shape[2:]:
+            latent_step_dim *= int(dim)
+        return vectors.reshape(batch_size, sequence_length, latent_step_dim)
+    raise ValueError(f"Expected latent vectors rank >= 2, got rank={vectors.ndim}")
 
 
 def sample_beta_time(

@@ -40,7 +40,8 @@ def test_config_defaults():
     assert config.latent_normalization_source == "latent"
     assert config.latent_supervision_key is None
     assert config.action_supervision_key is None
-    assert config.latent_code_seq_len == config.chunk_size
+    assert config.latent_sequence_length == config.chunk_size
+    assert config.max_latent_dim == config.max_action_dim
     assert not isinstance(config, SmolVLAConfig)
     assert isinstance(config.get_optimizer_preset(), AdamWConfig)
     assert isinstance(config.get_scheduler_preset(), CosineDecayWithWarmupSchedulerConfig)
@@ -55,41 +56,25 @@ def test_config_allows_shorter_latent_horizon_than_action_horizon():
     config = LatentSmolVLAConfig(
         chunk_size=6,
         n_action_steps=6,
-        latent_code_seq_len=4,
-        latent_vector_dim=24,
+        latent_delta_indices=[0, 2, 4, 6],
     )
     assert config.chunk_size == 6
-    assert config.latent_code_seq_len == 4
+    assert config.latent_sequence_length == 4
 
 
-def test_config_rejects_mismatched_latent_delta_indices_length():
-    with pytest.raises(ValueError, match="latent_delta_indices must have length latent_code_seq_len"):
+def test_config_rejects_empty_latent_delta_indices():
+    with pytest.raises(ValueError, match="latent_delta_indices must be non-empty"):
         LatentSmolVLAConfig(
             chunk_size=6,
             n_action_steps=6,
-            latent_code_seq_len=4,
-            latent_vector_dim=24,
-            latent_delta_indices=[0, 10, 20],
+            latent_delta_indices=[],
         )
 
 
-def test_config_requires_latent_step_dim_to_fit_latent_pad_dim():
-    with pytest.raises(ValueError, match="latent step dim <= max_latent_dim"):
-        LatentSmolVLAConfig(
-            chunk_size=4,
-            n_action_steps=4,
-            latent_code_seq_len=4,
-            latent_vector_dim=28,
-            max_latent_dim=6,
-        )
-
-
-def test_config_allows_latent_step_dim_to_exceed_action_pad_dim_when_latent_pad_dim_is_larger():
+def test_config_allows_latent_pad_dim_to_exceed_action_pad_dim():
     config = LatentSmolVLAConfig(
         chunk_size=4,
         n_action_steps=4,
-        latent_code_seq_len=4,
-        latent_vector_dim=28,
         max_action_dim=6,
         max_latent_dim=8,
     )
@@ -99,10 +84,9 @@ def test_config_allows_latent_step_dim_to_exceed_action_pad_dim_when_latent_pad_
 
 def test_preserve_configured_latent_and_supervision_keys():
     config = LatentSmolVLAConfig(
-        latent_code_seq_len=4,
-        latent_vector_dim=16,
         chunk_size=4,
         n_action_steps=4,
+        latent_delta_indices=[0, 1, 2, 3],
         latent_supervision_key="latent_supervision",
         action_supervision_key="action_supervision",
     )
@@ -320,6 +304,24 @@ def test_make_sequence_keep_mask_preserves_step_level_masks():
     )
 
 
+def test_make_sequence_keep_mask_squeezes_singleton_trailing_axis():
+    keep = make_sequence_keep_mask(
+        {
+            "latent_labels.valid": torch.tensor(
+                [[[True], [False], [True]], [[False], [True], [False]]]
+            )
+        },
+        key="latent_labels.valid",
+        batch_size=2,
+        sequence_length=3,
+        device=torch.device("cpu"),
+    )
+    assert torch.equal(
+        keep,
+        torch.tensor([[True, False, True], [False, True, False]], dtype=torch.bool),
+    )
+
+
 def test_expand_keep_mask_supports_sequence_masks():
     values = torch.arange(2 * 3 * 2, dtype=torch.float32).reshape(2, 3, 2)
     keep = torch.tensor([[True, False, True], [False, True, False]], dtype=torch.bool)
@@ -427,11 +429,16 @@ def test_reshape_latent_vector_sequence_from_flat():
     vectors = torch.arange(24, dtype=torch.float32).reshape(2, 12)
     seq = reshape_latent_vector_sequence(
         vectors,
-        latent_code_seq_len=3,
-        latent_vector_dim=12,
+        latent_sequence_length=3,
     )
     assert seq.shape == (2, 3, 4)
     assert torch.equal(seq.reshape(2, 12), vectors)
+
+
+def test_reshape_latent_vector_sequence_flattens_trailing_dims():
+    vectors = torch.arange(2 * 3 * 4 * 5, dtype=torch.float32).reshape(2, 3, 4, 5)
+    seq = reshape_latent_vector_sequence(vectors, latent_sequence_length=3)
+    assert seq.shape == (2, 3, 20)
 
 
 def test_policy_default_peft_targets_use_vector_diffusion_modules():
@@ -453,11 +460,10 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
         chunk_size=4,
         max_action_dim=6,
         max_latent_dim=6,
-        latent_code_seq_len=4,
-        latent_vector_dim=16,
+        latent_sequence_length=4,
+        latent_delta_indices=[0, 1, 2, 3],
         latent_teacher_force_ratio_end=0.0,
     )
-    model.latent_step_dim = 4
     model.max_latent_dim = 6
     model.latent_out_proj = nn.Linear(7, 6)
     model.action_out_proj = nn.Linear(7, 6)
@@ -511,11 +517,10 @@ def test_model_forward_returns_action_and_latent_shapes():
         chunk_size=4,
         max_action_dim=6,
         max_latent_dim=6,
-        latent_code_seq_len=4,
-        latent_vector_dim=16,
+        latent_sequence_length=4,
+        latent_delta_indices=[0, 1, 2, 3],
         latent_teacher_force_ratio_end=0.0,
     )
-    model.latent_step_dim = 4
     model.max_latent_dim = 6
     model.latent_out_proj = nn.Linear(7, 6)
     model.action_out_proj = nn.Linear(7, 6)
@@ -570,11 +575,10 @@ def test_model_forward_rejects_mismatched_latent_horizon():
         chunk_size=4,
         max_action_dim=6,
         max_latent_dim=6,
-        latent_code_seq_len=4,
-        latent_vector_dim=16,
+        latent_sequence_length=4,
+        latent_delta_indices=[0, 1, 2, 3],
         latent_teacher_force_ratio_end=0.0,
     )
-    model.latent_step_dim = 4
     model.max_latent_dim = 6
     model.latent_out_proj = nn.Linear(7, 6)
     model.action_out_proj = nn.Linear(7, 6)
@@ -604,7 +608,7 @@ def test_model_forward_rejects_mismatched_latent_horizon():
     model.action_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
     model.eval()
 
-    with pytest.raises(ValueError, match=r"Expected latent vector tensor \[B,4,4\]"):
+    with pytest.raises(ValueError, match=r"Expected latent vector tensor with sequence length 4"):
         model.forward(
             None,
             None,
@@ -723,7 +727,7 @@ def test_policy_forward_combines_latent_validity_with_dataset_padding():
         latent_supervision_key=None,
         action_supervision_key=None,
         max_action_dim=6,
-        latent_code_seq_len=4,
+        latent_sequence_length=4,
     )
     policy._compute_joint_vector_target_metrics = lambda *args, **kwargs: {}
     policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
@@ -751,3 +755,32 @@ def test_policy_forward_combines_latent_validity_with_dataset_padding():
     assert float(total) == pytest.approx(1.5)
     assert metrics["latent_loss"] == pytest.approx(0.5)
     assert metrics["batch_latent_supervised_tokens"] == 4.0
+
+
+def test_joint_vector_target_metrics_skip_joint_alignment_for_sparse_latents():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(max_action_dim=7)
+    policy.prepare_action = lambda batch: batch["action"]
+
+    batch = {
+        "action": torch.randn(2, 50, 7),
+        "action_is_pad": torch.zeros(2, 50, dtype=torch.bool),
+    }
+    labels = torch.randn(2, 5, 7)
+    action_keep = torch.tensor([True, False], dtype=torch.bool)
+    latent_keep = torch.tensor(
+        [[True, True, True, True, True], [True, False, False, False, False]],
+        dtype=torch.bool,
+    )
+
+    metrics = policy._compute_joint_vector_target_metrics(
+        batch,
+        labels,
+        action_keep=action_keep,
+        latent_keep=latent_keep,
+    )
+
+    assert metrics["joint_action_latent_target_seq_len_match"] == 0.0
+    assert metrics["batch_joint_supervised_samples"] == 1.0
+    assert metrics["batch_joint_supervised_tokens"] == 0.0
+    assert "joint_action_latent_target_mse" not in metrics
