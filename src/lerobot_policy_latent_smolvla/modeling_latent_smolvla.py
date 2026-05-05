@@ -508,11 +508,15 @@ class LatentSmolVLAFlowMatching(nn.Module):
         if not self.training:
             return float(self.config.latent_teacher_force_ratio_end)
         decay_steps = int(self.config.latent_teacher_force_decay_steps)
-        if decay_steps <= 0:
-            return float(self.config.latent_teacher_force_ratio_end)
-        progress = min(float(self._teacher_force_step.item()) / float(decay_steps), 1.0)
+        delay_steps = int(getattr(self.config, "latent_teacher_force_delay_steps", 0))
+        step = float(self._teacher_force_step.item())
         start = float(self.config.latent_teacher_force_ratio_start)
         end = float(self.config.latent_teacher_force_ratio_end)
+        if step < float(delay_steps):
+            return start
+        if decay_steps <= 0:
+            return end
+        progress = min((step - float(delay_steps)) / float(decay_steps), 1.0)
         return start + (end - start) * progress
 
     def forward(

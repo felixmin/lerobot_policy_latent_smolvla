@@ -87,6 +87,7 @@ class LatentSmolVLAConfig(PreTrainedConfig):
 
     latent_teacher_force_ratio_start: float = 1.0
     latent_teacher_force_ratio_end: float = 0.0
+    latent_teacher_force_delay_steps: int = 0
     latent_teacher_force_decay_steps: int = 100_000
     # Keep latent-related batch keys outside observation.* and route them explicitly
     # through latent_delta_indices so they can use future timestamp access without
@@ -167,6 +168,11 @@ class LatentSmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "latent_teacher_force_ratio_end must be in [0, 1], "
                 f"got {self.latent_teacher_force_ratio_end}"
+            )
+        if self.latent_teacher_force_delay_steps < 0:
+            raise ValueError(
+                "latent_teacher_force_delay_steps must be >= 0, "
+                f"got {self.latent_teacher_force_delay_steps}"
             )
         if self.latent_teacher_force_decay_steps < 0:
             raise ValueError(

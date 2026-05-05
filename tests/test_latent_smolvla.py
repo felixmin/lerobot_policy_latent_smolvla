@@ -40,6 +40,7 @@ def test_config_defaults():
     assert config.latent_normalization_source == "latent"
     assert config.latent_supervision_key is None
     assert config.action_supervision_key is None
+    assert config.latent_teacher_force_delay_steps == 0
     assert config.latent_sequence_length == config.chunk_size
     assert config.max_latent_dim == config.max_action_dim
     assert not isinstance(config, SmolVLAConfig)
@@ -50,6 +51,36 @@ def test_config_defaults():
 def test_config_rejects_invalid_latent_normalization_source():
     with pytest.raises(ValueError, match="latent_normalization_source"):
         LatentSmolVLAConfig(latent_normalization_source="prefer_action")
+
+
+def test_config_rejects_negative_teacher_force_delay():
+    with pytest.raises(ValueError, match="latent_teacher_force_delay_steps"):
+        LatentSmolVLAConfig(latent_teacher_force_delay_steps=-1)
+
+
+def test_model_teacher_force_ratio_uses_delay_then_linear_decay():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        latent_teacher_force_ratio_start=1.0,
+        latent_teacher_force_ratio_end=0.2,
+        latent_teacher_force_delay_steps=40_000,
+        latent_teacher_force_decay_steps=30_000,
+    )
+    model.register_buffer("_teacher_force_step", torch.zeros((), dtype=torch.long), persistent=False)
+    model.train()
+
+    expected = {
+        0: 1.0,
+        39_999: 1.0,
+        40_000: 1.0,
+        55_000: 0.6,
+        70_000: 0.2,
+        100_000: 0.2,
+    }
+    for step, ratio in expected.items():
+        model._teacher_force_step.fill_(step)
+        assert model.teacher_force_ratio() == pytest.approx(ratio)
 
 
 def test_config_allows_shorter_latent_horizon_than_action_horizon():
