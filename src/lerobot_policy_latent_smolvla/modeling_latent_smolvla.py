@@ -246,6 +246,17 @@ class LatentSmolVLAFlowMatching(nn.Module):
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
             params.requires_grad = self.config.train_state_proj
+        if getattr(self.config, "freeze_latent_stage", False):
+            latent_stage_modules = [
+                self.latent_vlm_with_expert.lm_expert,
+                self.latent_in_proj,
+                self.latent_out_proj,
+                self.latent_time_mlp_in,
+                self.latent_time_mlp_out,
+            ]
+            for module in latent_stage_modules:
+                for params in module.parameters():
+                    params.requires_grad = False
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -266,7 +277,13 @@ class LatentSmolVLAFlowMatching(nn.Module):
         )
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor | None = None,
+        state_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         embs = []
         pad_masks = []
@@ -319,14 +336,20 @@ class LatentSmolVLAFlowMatching(nn.Module):
         pad_masks.append(lang_masks)
         att_masks += [0] * lang_emb.shape[1]
 
-        state_emb = self.state_proj(state)
-        state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
-        embs.append(state_emb)
-        batch_size = state_emb.shape[0]
-        device = state_emb.device
-        state_mask = torch.ones(batch_size, state_emb.shape[1], dtype=torch.bool, device=device)
-        pad_masks.append(state_mask)
-        att_masks += [1] * state_emb.shape[1]
+        if state is not None:
+            state_emb = self.state_proj(state)
+            state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+            embs.append(state_emb)
+            batch_size = state_emb.shape[0]
+            device = state_emb.device
+            if state_mask is None:
+                state_mask = torch.ones(batch_size, state_emb.shape[1], dtype=torch.bool, device=device)
+            else:
+                state_mask = state_mask.to(device=device, dtype=torch.bool)
+                if state_mask.ndim == 1:
+                    state_mask = state_mask[:, None].expand(batch_size, state_emb.shape[1])
+            pad_masks.append(state_mask)
+            att_masks += [1] * state_emb.shape[1]
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -529,11 +552,24 @@ class LatentSmolVLAFlowMatching(nn.Module):
         actions: torch.Tensor | None,
         latent_vectors: torch.Tensor | None,
         latent_valid: torch.Tensor | None = None,
+        state_mask: torch.Tensor | None = None,
         noise: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
         time: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = int(state.shape[0])
-        device = state.device
+        if lang_tokens is not None:
+            batch_size = int(lang_tokens.shape[0])
+            device = lang_tokens.device
+        elif state is not None:
+            batch_size = int(state.shape[0])
+            device = state.device
+        elif actions is not None:
+            batch_size = int(actions.shape[0])
+            device = actions.device
+        elif latent_vectors is not None:
+            batch_size = int(latent_vectors.shape[0])
+            device = latent_vectors.device
+        else:
+            raise ValueError("Cannot infer batch size without language, state, action, or latent tensors")
         dtype = torch.float32
 
         if actions is None:
@@ -605,7 +641,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         action_u_t = action_noise - action_targets
 
         obs_prefix_embs, obs_prefix_pad_masks, obs_prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
 
         latent_suffix_embs, latent_suffix_pad_masks, latent_suffix_att_masks = self.embed_latent_suffix(
@@ -674,11 +710,12 @@ class LatentSmolVLAFlowMatching(nn.Module):
         lang_tokens,
         lang_masks,
         state,
+        state_mask=None,
         noise=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        batch_size = state.shape[0]
-        device = state.device
+        batch_size = lang_tokens.shape[0]
+        device = state.device if state is not None else lang_tokens.device
         latent_noise_input, action_noise_input = self.split_noise(noise)
         latent_noise = self.prepare_diffusion_noise(
             latent_noise_input,
@@ -698,7 +735,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         )
 
         obs_prefix_embs, obs_prefix_pad_masks, obs_prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
         latent_prefix_att_2d_masks = make_att_2d_masks(obs_prefix_pad_masks, obs_prefix_att_masks)
         latent_prefix_position_ids = torch.cumsum(obs_prefix_pad_masks, dim=1) - 1
@@ -909,8 +946,21 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         return images, img_masks
 
     def prepare_state(self, batch):
+        if getattr(self.config, "state_conditioning", "always") == "never":
+            return None
         state = batch[OBS_STATE][:, -1, :] if batch[OBS_STATE].ndim > 2 else batch[OBS_STATE]
         return pad_vector(state, self.config.max_state_dim)
+
+    def prepare_state_mask(self, batch, *, batch_size: int, device: torch.device) -> Tensor | None:
+        state_conditioning = getattr(self.config, "state_conditioning", "always")
+        if state_conditioning == "never":
+            return None
+        if state_conditioning == "always":
+            return torch.ones(batch_size, dtype=torch.bool, device=device)
+        key = self.config.action_supervision_key
+        if key is None or key not in batch:
+            return torch.ones(batch_size, dtype=torch.bool, device=device)
+        return make_sample_keep_mask(batch, key=key, batch_size=batch_size, device=device)
 
     def prepare_action(self, batch):
         return pad_vector(batch[ACTION], self.config.max_action_dim)
@@ -1144,13 +1194,18 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+        batch_size = int(lang_tokens.shape[0])
+        state_mask = self.prepare_state_mask(
+            batch,
+            batch_size=batch_size,
+            device=lang_tokens.device,
+        )
         batch_device = state.device if state is not None else lang_tokens.device
         latent_vector_labels = (
             batch[latent_key].to(device=batch_device, dtype=torch.float32)
             if latent_key in batch
             else None
         )
-        batch_size = int(lang_tokens.shape[0])
         latent_sequence_length = int(
             getattr(self.config, "latent_sequence_length", getattr(self.config, "chunk_size", 1))
         )
@@ -1203,6 +1258,7 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
             actions,
             latent_vector_labels,
             latent_valid=latent_valid,
+            state_mask=state_mask,
             noise=noise,
             time=time,
         )
@@ -1348,8 +1404,13 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+        state_mask = self.prepare_state_mask(
+            batch,
+            batch_size=int(lang_tokens.shape[0]),
+            device=lang_tokens.device,
+        )
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+            images, img_masks, lang_tokens, lang_masks, state, state_mask=state_mask, noise=noise, **kwargs
         )
 
         original_action_dim = self.config.action_feature.shape[0]
@@ -1386,25 +1447,36 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
         return self._queues[ACTION].popleft()
 
     def _get_default_peft_targets(self) -> dict[str, any]:
-        common_projections = [
-            "state_proj",
-            "latent_in_proj",
-            "latent_out_proj",
-            "latent_time_mlp_in",
-            "latent_time_mlp_out",
-            "latent_plan_proj",
-            "latent_anchor_mlp_in",
-            "latent_anchor_mlp_out",
-            "latent_duration_mlp_in",
-            "latent_duration_mlp_out",
-            "action_in_proj",
-            "action_out_proj",
-            "action_time_mlp_in",
-            "action_time_mlp_out",
-        ]
+        freeze_latent_stage = getattr(getattr(self, "config", None), "freeze_latent_stage", False)
+        common_projections = ["state_proj"]
+        if not freeze_latent_stage:
+            common_projections.extend(
+                [
+                    "latent_in_proj",
+                    "latent_out_proj",
+                    "latent_time_mlp_in",
+                    "latent_time_mlp_out",
+                ]
+            )
+        common_projections.extend(
+            [
+                "latent_plan_proj",
+                "latent_anchor_mlp_in",
+                "latent_anchor_mlp_out",
+                "latent_duration_mlp_in",
+                "latent_duration_mlp_out",
+                "action_in_proj",
+                "action_out_proj",
+                "action_time_mlp_in",
+                "action_time_mlp_out",
+            ]
+        )
         common_projection_pattern = "|".join(common_projections)
+        expert_pattern = "action_vlm_with_expert"
+        if not freeze_latent_stage:
+            expert_pattern = "latent_vlm_with_expert|action_vlm_with_expert"
         target_modules = (
-            rf"(model\.(latent_vlm_with_expert|action_vlm_with_expert)\.lm_expert\..*\.(q|v)_proj|model\.({common_projection_pattern}))"
+            rf"(model\.({expert_pattern})\.lm_expert\..*\.(q|v)_proj|model\.({common_projection_pattern}))"
         )
         return {
             "target_modules": target_modules,

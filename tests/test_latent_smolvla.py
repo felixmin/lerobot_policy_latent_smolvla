@@ -40,6 +40,8 @@ def test_config_defaults():
     assert config.latent_normalization_source == "latent"
     assert config.latent_supervision_key is None
     assert config.action_supervision_key is None
+    assert config.freeze_latent_stage is False
+    assert config.state_conditioning == "action_supervised"
     assert config.latent_teacher_force_delay_steps == 0
     assert config.latent_sequence_length == config.chunk_size
     assert config.max_latent_dim == config.max_action_dim
@@ -53,9 +55,25 @@ def test_config_rejects_invalid_latent_normalization_source():
         LatentSmolVLAConfig(latent_normalization_source="prefer_action")
 
 
+def test_config_rejects_invalid_state_conditioning():
+    with pytest.raises(ValueError, match="state_conditioning"):
+        LatentSmolVLAConfig(state_conditioning="sometimes")
+
+
 def test_config_rejects_negative_teacher_force_delay():
     with pytest.raises(ValueError, match="latent_teacher_force_delay_steps"):
         LatentSmolVLAConfig(latent_teacher_force_delay_steps=-1)
+
+
+def test_config_allows_zero_latent_loss_weight_for_multitask_action_finetune():
+    config = LatentSmolVLAConfig(training_mode="multitask", latent_loss_weight=0.0)
+
+    assert config.latent_loss_weight == 0.0
+
+
+def test_config_rejects_zero_latent_loss_weight_for_latent_only_training():
+    with pytest.raises(ValueError, match="latent_loss_weight"):
+        LatentSmolVLAConfig(training_mode="latent", latent_loss_weight=0.0)
 
 
 def test_model_teacher_force_ratio_uses_delay_then_linear_decay():
@@ -447,6 +465,54 @@ def test_policy_latent_keep_mask_intersects_valid_samples():
     )
 
 
+def test_policy_state_mask_uses_action_supervision_by_default():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        state_conditioning="action_supervised",
+        action_supervision_key="action_supervision",
+    )
+    batch = {"action_supervision": torch.tensor([True, False, True])}
+
+    mask = policy.prepare_state_mask(
+        batch,
+        batch_size=3,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(mask, torch.tensor([True, False, True]))
+
+
+def test_policy_state_mask_keeps_state_when_action_supervision_key_missing():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        state_conditioning="action_supervised",
+        action_supervision_key="action_supervision",
+    )
+
+    mask = policy.prepare_state_mask(
+        {},
+        batch_size=3,
+        device=torch.device("cpu"),
+    )
+
+    assert torch.equal(mask, torch.ones(3, dtype=torch.bool))
+
+
+def test_policy_prepare_state_can_disable_state_globally():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(state_conditioning="never", max_state_dim=4)
+
+    state = policy.prepare_state({"observation.state": torch.randn(2, 3)})
+    mask = policy.prepare_state_mask(
+        {"observation.state": torch.randn(2, 3)},
+        batch_size=2,
+        device=torch.device("cpu"),
+    )
+
+    assert state is None
+    assert mask is None
+
+
 def test_parameter_grad_l2_norm_ignores_missing_grads():
     first = nn.Parameter(torch.zeros(2, dtype=torch.float32))
     second = nn.Parameter(torch.zeros(2, dtype=torch.float32))
@@ -482,6 +548,50 @@ def test_policy_default_peft_targets_use_vector_diffusion_modules():
     assert "action_in_proj" in targets["target_modules"]
     assert "action_out_proj" in targets["target_modules"]
     assert targets["modules_to_save"] == []
+
+
+def test_policy_default_peft_targets_skip_frozen_latent_stage_modules():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(freeze_latent_stage=True)
+
+    targets = policy._get_default_peft_targets()
+
+    assert "latent_vlm_with_expert" not in targets["target_modules"]
+    assert "latent_in_proj" not in targets["target_modules"]
+    assert "latent_out_proj" not in targets["target_modules"]
+    assert "latent_time_mlp_in" not in targets["target_modules"]
+    assert "latent_plan_proj" in targets["target_modules"]
+    assert "action_vlm_with_expert" in targets["target_modules"]
+    assert "action_out_proj" in targets["target_modules"]
+
+
+def test_model_freeze_latent_stage_keeps_action_interface_trainable():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(train_state_proj=True, freeze_latent_stage=True)
+    model.state_proj = nn.Linear(2, 2)
+    model.latent_vlm_with_expert = SimpleNamespace(lm_expert=nn.Linear(2, 2))
+    model.latent_in_proj = nn.Linear(2, 2)
+    model.latent_out_proj = nn.Linear(2, 2)
+    model.latent_time_mlp_in = nn.Linear(2, 2)
+    model.latent_time_mlp_out = nn.Linear(2, 2)
+    model.latent_plan_proj = nn.Linear(2, 2)
+    model.latent_anchor_mlp_in = nn.Linear(1, 2)
+    model.action_out_proj = nn.Linear(2, 2)
+
+    model.set_requires_grad()
+
+    frozen_modules = [
+        model.latent_vlm_with_expert.lm_expert,
+        model.latent_in_proj,
+        model.latent_out_proj,
+        model.latent_time_mlp_in,
+        model.latent_time_mlp_out,
+    ]
+    assert all(not parameter.requires_grad for module in frozen_modules for parameter in module.parameters())
+    assert all(parameter.requires_grad for parameter in model.latent_plan_proj.parameters())
+    assert all(parameter.requires_grad for parameter in model.latent_anchor_mlp_in.parameters())
+    assert all(parameter.requires_grad for parameter in model.action_out_proj.parameters())
 
 
 def test_model_forward_returns_unreduced_action_and_latent_losses_shape():

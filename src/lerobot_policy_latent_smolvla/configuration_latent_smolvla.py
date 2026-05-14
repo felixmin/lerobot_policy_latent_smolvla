@@ -48,6 +48,7 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
     train_state_proj: bool = True
+    state_conditioning: str = "action_supervised"
 
     # Training presets.
     optimizer_lr: float = 1e-4
@@ -84,6 +85,7 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     latent_head_mode: str = "vector_diffusion"
     action_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
+    freeze_latent_stage: bool = False
 
     latent_teacher_force_ratio_start: float = 1.0
     latent_teacher_force_ratio_end: float = 0.0
@@ -135,6 +137,11 @@ class LatentSmolVLAConfig(PreTrainedConfig):
                 "latent_normalization_source must be one of {'latent', 'action'}, "
                 f"got {self.latent_normalization_source!r}"
             )
+        if self.state_conditioning not in {"always", "never", "action_supervised"}:
+            raise ValueError(
+                "state_conditioning must be one of {'always', 'never', 'action_supervised'}, "
+                f"got {self.state_conditioning!r}"
+            )
         if self.action_loss_weight < 0.0:
             raise ValueError(
                 f"action_loss_weight must be >= 0, got {self.action_loss_weight}"
@@ -183,9 +190,9 @@ class LatentSmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "action_loss_weight must be > 0 when training_mode uses action supervision"
             )
-        if self.training_mode in {"latent", "multitask"} and self.latent_loss_weight == 0.0:
+        if self.training_mode == "latent" and self.latent_loss_weight == 0.0:
             raise ValueError(
-                "latent_loss_weight must be > 0 when training_mode uses latent supervision"
+                "latent_loss_weight must be > 0 when training_mode='latent'"
             )
 
     def validate_features(self) -> None:
