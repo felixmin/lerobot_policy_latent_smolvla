@@ -632,10 +632,6 @@ class LatentSmolVLAFlowMatching(nn.Module):
         if action_time is None:
             action_time = self.sample_time(batch_size, device)
 
-        latent_time_expanded = latent_time[:, None, None]
-        latent_x_t = latent_time_expanded * latent_noise + (1 - latent_time_expanded) * latent_targets
-        latent_u_t = latent_noise - latent_targets
-
         action_time_expanded = action_time[:, None, None]
         action_x_t = action_time_expanded * action_noise + (1 - action_time_expanded) * action_targets
         action_u_t = action_noise - action_targets
@@ -644,27 +640,44 @@ class LatentSmolVLAFlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
 
-        latent_suffix_embs, latent_suffix_pad_masks, latent_suffix_att_masks = self.embed_latent_suffix(
-            latent_x_t, latent_time
+        latent_conditioning = getattr(self.config, "latent_conditioning", "predicted")
+        needs_latent_loss = (
+            getattr(self.config, "training_mode", "multitask") in {"latent", "multitask"}
+            and float(getattr(self.config, "latent_loss_weight", 1.0)) > 0.0
         )
-        latent_pad_masks = torch.cat([obs_prefix_pad_masks, latent_suffix_pad_masks], dim=1)
-        latent_att_masks = torch.cat([obs_prefix_att_masks, latent_suffix_att_masks], dim=1)
-        latent_att_2d_masks = make_att_2d_masks(latent_pad_masks, latent_att_masks)
-        latent_position_ids = torch.cumsum(latent_pad_masks, dim=1) - 1
-        (_, latent_suffix_out), _ = self.latent_vlm_with_expert.forward(
-            attention_mask=latent_att_2d_masks,
-            position_ids=latent_position_ids,
-            past_key_values=None,
-            inputs_embeds=[obs_prefix_embs, latent_suffix_embs],
-            use_cache=False,
-            fill_kv_cache=False,
-        )
-        latent_suffix_out = latent_suffix_out[:, -int(latent_targets.shape[1]) :].to(dtype=torch.float32)
-        latent_v_t = self.latent_out_proj(latent_suffix_out)
-        latent_losses = F.mse_loss(latent_u_t, latent_v_t, reduction="none")
-        latent_hat = latent_x_t - latent_time_expanded * latent_v_t
+        run_latent_stage = latent_conditioning != "zeros" or needs_latent_loss
 
-        if self.training:
+        if run_latent_stage:
+            latent_time_expanded = latent_time[:, None, None]
+            latent_x_t = latent_time_expanded * latent_noise + (1 - latent_time_expanded) * latent_targets
+            latent_u_t = latent_noise - latent_targets
+
+            latent_suffix_embs, latent_suffix_pad_masks, latent_suffix_att_masks = self.embed_latent_suffix(
+                latent_x_t, latent_time
+            )
+            latent_pad_masks = torch.cat([obs_prefix_pad_masks, latent_suffix_pad_masks], dim=1)
+            latent_att_masks = torch.cat([obs_prefix_att_masks, latent_suffix_att_masks], dim=1)
+            latent_att_2d_masks = make_att_2d_masks(latent_pad_masks, latent_att_masks)
+            latent_position_ids = torch.cumsum(latent_pad_masks, dim=1) - 1
+            (_, latent_suffix_out), _ = self.latent_vlm_with_expert.forward(
+                attention_mask=latent_att_2d_masks,
+                position_ids=latent_position_ids,
+                past_key_values=None,
+                inputs_embeds=[obs_prefix_embs, latent_suffix_embs],
+                use_cache=False,
+                fill_kv_cache=False,
+            )
+            latent_suffix_out = latent_suffix_out[:, -int(latent_targets.shape[1]) :].to(dtype=torch.float32)
+            latent_v_t = self.latent_out_proj(latent_suffix_out)
+            latent_losses = F.mse_loss(latent_u_t, latent_v_t, reduction="none")
+            latent_hat = latent_x_t - latent_time_expanded * latent_v_t
+        else:
+            latent_losses = torch.zeros_like(latent_targets)
+            latent_hat = torch.zeros_like(latent_targets)
+
+        if latent_conditioning == "zeros":
+            latent_condition = torch.zeros_like(latent_targets)
+        elif self.training:
             teacher_force_ratio = self.teacher_force_ratio()
             teacher_force_mask = (
                 torch.rand(batch_size, device=device) < teacher_force_ratio
@@ -717,14 +730,6 @@ class LatentSmolVLAFlowMatching(nn.Module):
         batch_size = lang_tokens.shape[0]
         device = state.device if state is not None else lang_tokens.device
         latent_noise_input, action_noise_input = self.split_noise(noise)
-        latent_noise = self.prepare_diffusion_noise(
-            latent_noise_input,
-            batch_size=batch_size,
-            sequence_length=int(self.config.latent_sequence_length),
-            feature_dim=self.max_latent_dim,
-            device=device,
-            dtype=torch.float32,
-        )
         action_noise = self.prepare_diffusion_noise(
             action_noise_input,
             batch_size=batch_size,
@@ -737,31 +742,49 @@ class LatentSmolVLAFlowMatching(nn.Module):
         obs_prefix_embs, obs_prefix_pad_masks, obs_prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
-        latent_prefix_att_2d_masks = make_att_2d_masks(obs_prefix_pad_masks, obs_prefix_att_masks)
-        latent_prefix_position_ids = torch.cumsum(obs_prefix_pad_masks, dim=1) - 1
-        _, latent_past_key_values = self.latent_vlm_with_expert.forward(
-            attention_mask=latent_prefix_att_2d_masks,
-            position_ids=latent_prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[obs_prefix_embs, None],
-            use_cache=self.config.use_cache,
-            fill_kv_cache=True,
-        )
 
         num_steps = self.config.num_steps
         dt = -1.0 / num_steps
 
-        latent_x_t = latent_noise
-        for step in range(num_steps):
-            current_time = 1.0 + step * dt
-            latent_time = torch.tensor(current_time, dtype=torch.float32, device=device).expand(batch_size)
-            latent_v_t = self.denoise_latent_step(
-                prefix_pad_masks=obs_prefix_pad_masks,
-                past_key_values=latent_past_key_values,
-                x_t=latent_x_t,
-                timestep=latent_time,
+        if getattr(self.config, "latent_conditioning", "predicted") == "zeros":
+            latent_x_t = torch.zeros(
+                batch_size,
+                int(self.config.latent_sequence_length),
+                self.max_latent_dim,
+                device=device,
+                dtype=torch.float32,
             )
-            latent_x_t = latent_x_t + dt * latent_v_t
+        else:
+            latent_noise = self.prepare_diffusion_noise(
+                latent_noise_input,
+                batch_size=batch_size,
+                sequence_length=int(self.config.latent_sequence_length),
+                feature_dim=self.max_latent_dim,
+                device=device,
+                dtype=torch.float32,
+            )
+            latent_prefix_att_2d_masks = make_att_2d_masks(obs_prefix_pad_masks, obs_prefix_att_masks)
+            latent_prefix_position_ids = torch.cumsum(obs_prefix_pad_masks, dim=1) - 1
+            _, latent_past_key_values = self.latent_vlm_with_expert.forward(
+                attention_mask=latent_prefix_att_2d_masks,
+                position_ids=latent_prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[obs_prefix_embs, None],
+                use_cache=self.config.use_cache,
+                fill_kv_cache=True,
+            )
+
+            latent_x_t = latent_noise
+            for step in range(num_steps):
+                current_time = 1.0 + step * dt
+                latent_time = torch.tensor(current_time, dtype=torch.float32, device=device).expand(batch_size)
+                latent_v_t = self.denoise_latent_step(
+                    prefix_pad_masks=obs_prefix_pad_masks,
+                    past_key_values=latent_past_key_values,
+                    x_t=latent_x_t,
+                    timestep=latent_time,
+                )
+                latent_x_t = latent_x_t + dt * latent_v_t
 
         plan_embs, plan_pad_masks, plan_att_masks = self.embed_latent_plan(
             latent_x_t,

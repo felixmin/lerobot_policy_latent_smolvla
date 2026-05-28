@@ -86,6 +86,7 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     action_loss_weight: float = 1.0
     latent_loss_weight: float = 1.0
     freeze_latent_stage: bool = False
+    latent_conditioning: str = "predicted"
 
     latent_teacher_force_ratio_start: float = 1.0
     latent_teacher_force_ratio_end: float = 0.0
@@ -141,6 +142,11 @@ class LatentSmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 "state_conditioning must be one of {'always', 'never', 'action_supervised'}, "
                 f"got {self.state_conditioning!r}"
+            )
+        if self.latent_conditioning not in {"predicted", "zeros"}:
+            raise ValueError(
+                "latent_conditioning must be one of {'predicted', 'zeros'}, "
+                f"got {self.latent_conditioning!r}"
             )
         if self.action_loss_weight < 0.0:
             raise ValueError(

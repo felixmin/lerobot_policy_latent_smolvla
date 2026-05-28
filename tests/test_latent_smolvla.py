@@ -41,6 +41,7 @@ def test_config_defaults():
     assert config.latent_supervision_key is None
     assert config.action_supervision_key is None
     assert config.freeze_latent_stage is False
+    assert config.latent_conditioning == "predicted"
     assert config.state_conditioning == "action_supervised"
     assert config.latent_teacher_force_delay_steps == 0
     assert config.latent_sequence_length == config.chunk_size
@@ -58,6 +59,11 @@ def test_config_rejects_invalid_latent_normalization_source():
 def test_config_rejects_invalid_state_conditioning():
     with pytest.raises(ValueError, match="state_conditioning"):
         LatentSmolVLAConfig(state_conditioning="sometimes")
+
+
+def test_config_rejects_invalid_latent_conditioning():
+    with pytest.raises(ValueError, match="latent_conditioning"):
+        LatentSmolVLAConfig(latent_conditioning="disabled")
 
 
 def test_config_rejects_negative_teacher_force_delay():
@@ -631,7 +637,17 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
         torch.zeros(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
     )
     model.latent_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
-    model.action_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.action_vlm_with_expert = SimpleNamespace(
+        forward=lambda **kwargs: (
+            [
+                kwargs["inputs_embeds"][0],
+                None
+                if kwargs["inputs_embeds"][1] is None
+                else torch.ones_like(kwargs["inputs_embeds"][1]),
+            ],
+            None,
+        )
+    )
     model.eval()
 
     actions = torch.randn(2, 4, 6)
@@ -688,7 +704,17 @@ def test_model_forward_returns_action_and_latent_shapes():
         torch.zeros(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
     )
     model.latent_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
-    model.action_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.action_vlm_with_expert = SimpleNamespace(
+        forward=lambda **kwargs: (
+            [
+                kwargs["inputs_embeds"][0],
+                None
+                if kwargs["inputs_embeds"][1] is None
+                else torch.ones_like(kwargs["inputs_embeds"][1]),
+            ],
+            None,
+        )
+    )
     model.eval()
 
     actions = torch.randn(2, 4, 6)
@@ -707,6 +733,126 @@ def test_model_forward_returns_action_and_latent_shapes():
 
     assert action_losses.shape == actions.shape
     assert latent_losses.shape == (2, 4, 6)
+
+
+def test_model_forward_zero_latent_conditioning_skips_latent_expert_for_action_mode():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        chunk_size=4,
+        max_action_dim=6,
+        max_latent_dim=6,
+        latent_sequence_length=4,
+        latent_delta_indices=[0, 1, 2, 3],
+        latent_conditioning="zeros",
+        training_mode="action",
+        latent_loss_weight=1.0,
+    )
+    model.max_latent_dim = 6
+    model.action_out_proj = nn.Linear(7, 6)
+    model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
+    model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(2, 4, 7),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(2, 4, dtype=torch.bool),
+    )
+    model.embed_latent_suffix = lambda *args, **kwargs: pytest.fail("latent suffix should not be embedded")
+    model.embed_action_suffix = lambda noisy_motion, timestep: (
+        torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
+        torch.ones(noisy_motion.shape[0], noisy_motion.shape[1]),
+    )
+
+    def embed_latent_plan(latent_plan, latent_valid=None, action_horizon=4):
+        assert torch.count_nonzero(latent_plan) == 0
+        return (
+            torch.zeros(latent_plan.shape[0], latent_plan.shape[1], 7),
+            torch.ones(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+            torch.zeros(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+        )
+
+    model.embed_latent_plan = embed_latent_plan
+    model.latent_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: pytest.fail("latent expert should not run"))
+    model.action_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: ([kwargs["inputs_embeds"][0], torch.ones_like(kwargs["inputs_embeds"][1])], None))
+    model.train()
+
+    actions = torch.randn(2, 4, 6)
+    action_losses, latent_losses = model.forward(
+        None,
+        None,
+        None,
+        None,
+        torch.zeros(2, 6),
+        actions,
+        latent_vectors=None,
+        noise=(torch.zeros(2, 4, 6), torch.zeros(2, 4, 6)),
+        time=torch.full((2,), 0.5),
+    )
+
+    assert action_losses.shape == actions.shape
+    assert latent_losses.shape == (2, 4, 6)
+    assert torch.count_nonzero(latent_losses) == 0
+
+
+def test_model_sample_actions_zero_latent_conditioning_skips_latent_denoising():
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        chunk_size=4,
+        max_action_dim=6,
+        max_latent_dim=6,
+        latent_sequence_length=4,
+        latent_conditioning="zeros",
+        num_steps=2,
+        use_cache=True,
+        rtc_config=None,
+    )
+    model.max_latent_dim = 6
+    model.rtc_processor = None
+    model.action_out_proj = nn.Linear(7, 6)
+    model.prepare_diffusion_noise = lambda noise, batch_size, sequence_length, feature_dim, device, dtype: torch.zeros(
+        batch_size, sequence_length, feature_dim, device=device, dtype=dtype
+    )
+    model.embed_prefix = lambda *args, **kwargs: (
+        torch.zeros(2, 4, 7),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(2, 4, dtype=torch.bool),
+    )
+
+    def embed_latent_plan(latent_plan, latent_valid=None, action_horizon=4):
+        assert torch.count_nonzero(latent_plan) == 0
+        return (
+            torch.zeros(latent_plan.shape[0], latent_plan.shape[1], 7),
+            torch.ones(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+            torch.zeros(latent_plan.shape[0], latent_plan.shape[1], dtype=torch.bool),
+        )
+
+    model.embed_latent_plan = embed_latent_plan
+    model.latent_vlm_with_expert = SimpleNamespace(forward=lambda **kwargs: pytest.fail("latent expert should not run"))
+    model.action_vlm_with_expert = SimpleNamespace(
+        forward=lambda **kwargs: (
+            [
+                kwargs["inputs_embeds"][0],
+                None
+                if kwargs["inputs_embeds"][1] is None
+                else torch.ones_like(kwargs["inputs_embeds"][1]),
+            ],
+            None,
+        )
+    )
+    model.denoise_action_step = lambda **kwargs: torch.zeros_like(kwargs["x_t"])
+    model.eval()
+
+    actions = model.sample_actions(
+        None,
+        None,
+        torch.zeros(2, 5, dtype=torch.long),
+        torch.ones(2, 5, dtype=torch.bool),
+        torch.zeros(2, 6),
+    )
+
+    assert actions.shape == (2, 4, 6)
 
 
 def test_model_forward_rejects_mismatched_latent_horizon():
