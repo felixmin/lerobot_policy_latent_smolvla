@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
 
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
     ComplementaryDataProcessorStep,
     DeviceProcessorStep,
@@ -14,13 +15,18 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStepRegistry,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import batch_to_transition, policy_action_to_transition, transition_to_policy_action
 from lerobot.types import TransitionKey
-from lerobot.utils.constants import ACTION, POLICY_POSTPROCESSOR_DEFAULT_NAME, POLICY_PREPROCESSOR_DEFAULT_NAME
+from lerobot.utils.constants import (
+    ACTION,
+    POLICY_POSTPROCESSOR_DEFAULT_NAME,
+    POLICY_PREPROCESSOR_DEFAULT_NAME,
+)
 
 from lerobot_policy_latent_smolvla.configuration_latent_smolvla import LatentSmolVLAConfig
 
@@ -32,9 +38,18 @@ def make_latent_smolvla_pre_post_processors(
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
+    # Shared relative-action approach with plain SmolVLA: the core paired
+    # RelativeActionsProcessorStep / AbsoluteActionsProcessorStep (action ∓ state
+    # around normalization). Latent SmolVLA only adds its latent-specific steps.
+    relative_step = RelativeActionsProcessorStep(
+        enabled=bool(config.use_relative_actions),
+        exclude_joints=list(config.relative_exclude_joints),
+        action_names=list(config.action_feature_names),
+    )
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
+        relative_step,
         LatentSmolVLANewLineProcessor(),
         TokenizerProcessorStep(
             tokenizer_name=config.vlm_model_name,
@@ -62,6 +77,10 @@ def make_latent_smolvla_pre_post_processors(
             features=config.output_features,
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
+        ),
+        AbsoluteActionsProcessorStep(
+            enabled=bool(config.use_relative_actions),
+            relative_step=relative_step,
         ),
         DeviceProcessorStep(device="cpu"),
     ]
@@ -104,6 +123,33 @@ def _make_batch_to_transition_with_latent_keys(
         return transition
 
     return _to_transition
+
+
+@ProcessorStepRegistry.register(name="latent_smolvla_relative_actions_processor")
+@dataclass
+class LatentSmolVLARelativeActionsProcessorStep(RelativeActionsProcessorStep):
+    """Backward-compat registry alias for the core relative-action step.
+
+    Latent SmolVLA now shares the core RelativeActionsProcessorStep, but checkpoints
+    trained before that serialized this registry name. It is a pure subclass with
+    identical behavior; being a RelativeActionsProcessorStep keeps old checkpoints
+    recognized by the sync/RTC guards and lerobot's post-load absolute/relative
+    re-pairing in ``make_pre_post_processors``.
+    """
+
+
+@ProcessorStepRegistry.register(name="latent_smolvla_absolute_actions_processor")
+@dataclass
+class LatentSmolVLAAbsoluteActionsProcessorStep(AbsoluteActionsProcessorStep):
+    """Backward-compat registry alias for the core absolute-action step.
+
+    Older checkpoints serialized ``exclude_joints``/``action_names`` on the absolute
+    step; the core step derives its mask from the paired relative step, so these are
+    accepted purely for deserialization and otherwise ignored.
+    """
+
+    exclude_joints: list[str] = field(default_factory=list)
+    action_names: list[str] | None = None
 
 
 @ProcessorStepRegistry.register(name="latent_smolvla_new_line_processor")

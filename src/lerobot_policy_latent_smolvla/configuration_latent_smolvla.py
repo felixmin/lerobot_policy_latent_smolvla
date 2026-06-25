@@ -39,6 +39,22 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     adapt_to_pi_aloha: bool = False
     use_delta_joint_actions_aloha: bool = False
 
+    # DK1 absolute EE-pose datasets can train action heads in relative space:
+    # relative = action - current observation.state for non-excluded dimensions.
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    action_feature_names: list[str] = field(
+        default_factory=lambda: [
+            "ee.x",
+            "ee.y",
+            "ee.z",
+            "ee.wx",
+            "ee.wy",
+            "ee.wz",
+            "ee.gripper_pos",
+        ]
+    )
+
     # Tokenizer / decoding.
     tokenizer_max_length: int = 48
     num_steps: int = 10
