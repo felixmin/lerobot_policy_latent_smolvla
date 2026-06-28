@@ -276,163 +276,72 @@ class LatentSmolVLAFlowMatching(nn.Module):
             beta=float(self.config.latent_flow_beta_beta),
         )
 
-    def _resolve_head_cameras(self, image_keys):
-        """Split the available cameras into the latent head's and the action head's sets.
-
-        ``None`` on either config list means "all cameras" (legacy behavior). Each
-        head's configured order is preserved; cameras not actually loaded this batch
-        are ignored so a stage degrades gracefully rather than raising.
-        """
-        all_set = set(image_keys)
-        latent = getattr(self.config, "latent_camera_keys", None)
-        action = getattr(self.config, "action_camera_keys", None)
-        latent = list(latent) if latent is not None else list(image_keys)
-        action = list(action) if action is not None else list(image_keys)
-        latent = [key for key in latent if key in all_set]
-        action = [key for key in action if key in all_set]
-        return latent, action
-
-    def _embed_one_image(self, img):
-        img_emb = self.latent_vlm_with_expert.embed_image(img)
-        return img_emb * torch.tensor(
-            img_emb.shape[-1] ** 0.5, dtype=img_emb.dtype, device=img_emb.device
+    def _head_prefixes(self, images, img_masks, image_keys, lang_tokens, lang_masks, state=None, state_mask=None):
+        """Build the (latent, action) prefixes. Each camera is encoded once; the latent
+        prefix omits any action-only camera so the latent stage never depends on it.
+        latent_camera_keys / action_camera_keys default to None = all cameras."""
+        tokens = {}
+        for key, img, mask in zip(image_keys, images, img_masks, strict=True):
+            emb = self.latent_vlm_with_expert.embed_image(img)
+            tokens[key] = (emb * (emb.shape[-1] ** 0.5), mask)
+        latent_keys = self.config.latent_camera_keys or image_keys
+        action_keys = self.config.action_camera_keys or image_keys
+        return (
+            self.embed_prefix([tokens[k] for k in latent_keys], lang_tokens, lang_masks, state, state_mask),
+            self.embed_prefix([tokens[k] for k in action_keys], lang_tokens, lang_masks, state, state_mask),
         )
 
-    def embed_all_images(self, images, img_masks, image_keys):
-        """Encode each distinct camera once with the shared frozen vision encoder.
-
-        Returns ``{camera_key: (image_tokens, sample_mask)}`` so a camera shared by
-        both heads is not re-embedded per head.
-        """
-        return {
-            key: (self._embed_one_image(img), mask)
-            for key, img, mask in zip(image_keys, images, img_masks, strict=True)
-        }
-
-    def build_prefix(
-        self,
-        image_cache,
-        image_keys,
-        lang_tokens,
-        lang_masks,
-        state: torch.Tensor | None = None,
-        state_mask: torch.Tensor | None = None,
+    def embed_prefix(
+        self, image_tokens, lang_tokens, lang_masks, state=None, state_mask=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Assemble one head's observation prefix from cached image tokens + lang + state."""
-        embs = []
-        pad_masks = []
-        att_masks = []
+        """Assemble one head's prefix from pre-encoded image tokens + language + state.
+        image_tokens is an ordered list of (image_emb, sample_mask) pairs."""
+        embs, pad_masks, att_masks = [], [], []
 
-        for key in image_keys:
-            img_emb, img_mask = image_cache[key]
+        def special(token, batch_size):  # image start/end marker, embedded as a language token
+            t = self.latent_vlm_with_expert.embed_language_tokens(
+                token.to(device=self.latent_vlm_with_expert.vlm.device)
+            ).unsqueeze(0).expand(batch_size, -1, -1)
+            embs.append(t)
+            pad_masks.append(torch.ones_like(t[:, :, 0], dtype=torch.bool))
+            att_masks.extend([0] * t.shape[1])
+
+        for img_emb, img_mask in image_tokens:
             batch_size, num_img_embs = img_emb.shape[:2]
             if self.add_image_special_tokens:
-                image_start_token = (
-                    self.latent_vlm_with_expert.embed_language_tokens(
-                        self.global_image_start_token.to(device=self.latent_vlm_with_expert.vlm.device)
-                    )
-                    .unsqueeze(0)
-                    .expand(batch_size, -1, -1)
-                )
-                embs.append(image_start_token)
-                pad_masks.append(
-                    torch.ones_like(image_start_token[:, :, 0], dtype=torch.bool)
-                )
-                att_masks += [0] * image_start_token.shape[1]
-
-            expanded_img_mask = img_mask[:, None].expand(batch_size, num_img_embs)
+                special(self.global_image_start_token, batch_size)
             embs.append(img_emb)
-            pad_masks.append(expanded_img_mask)
-            att_masks += [0] * num_img_embs
-
+            pad_masks.append(img_mask[:, None].expand(batch_size, num_img_embs))
+            att_masks.extend([0] * num_img_embs)
             if self.add_image_special_tokens:
-                image_end_token = (
-                    self.latent_vlm_with_expert.embed_language_tokens(
-                        self.image_end_token.to(device=self.latent_vlm_with_expert.vlm.device)
-                    )
-                    .unsqueeze(0)
-                    .expand(batch_size, -1, -1)
-                )
-                embs.append(image_end_token)
-                pad_masks.append(
-                    torch.ones_like(image_end_token[:, :, 0], dtype=torch.bool)
-                )
-                att_masks += [0] * image_end_token.shape[1]
+                special(self.image_end_token, batch_size)
 
         lang_emb = self.latent_vlm_with_expert.embed_language_tokens(lang_tokens)
-        lang_emb = lang_emb * math.sqrt(lang_emb.shape[-1])
-        embs.append(lang_emb)
+        embs.append(lang_emb * math.sqrt(lang_emb.shape[-1]))
         pad_masks.append(lang_masks)
-        att_masks += [0] * lang_emb.shape[1]
+        att_masks.extend([0] * lang_emb.shape[1])
 
         if state is not None:
             state_emb = self.state_proj(state)
             state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
-            embs.append(state_emb)
-            batch_size = state_emb.shape[0]
-            device = state_emb.device
             if state_mask is None:
-                state_mask = torch.ones(batch_size, state_emb.shape[1], dtype=torch.bool, device=device)
+                state_mask = torch.ones(state_emb.shape[:2], dtype=torch.bool, device=state_emb.device)
             else:
-                state_mask = state_mask.to(device=device, dtype=torch.bool)
+                state_mask = state_mask.to(device=state_emb.device, dtype=torch.bool)
                 if state_mask.ndim == 1:
-                    state_mask = state_mask[:, None].expand(batch_size, state_emb.shape[1])
+                    state_mask = state_mask[:, None].expand(state_emb.shape[:2])
+            embs.append(state_emb)
             pad_masks.append(state_mask)
-            att_masks += [1] * state_emb.shape[1]
+            att_masks.extend([1] * state_emb.shape[1])
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)[None, :]
-
-        batch_size = pad_masks.shape[0]
-        seq_len = pad_masks.shape[1]
-        if seq_len < self.prefix_length:
+        if pad_masks.shape[1] < self.prefix_length:
             embs = pad_tensor(embs, self.prefix_length, pad_value=0)
             pad_masks = pad_tensor(pad_masks, self.prefix_length, pad_value=0)
             att_masks = pad_tensor(att_masks, self.prefix_length, pad_value=0)
-
-        return embs, pad_masks, att_masks.expand(batch_size, -1)
-
-    def _embed_head_prefixes(
-        self,
-        images,
-        img_masks,
-        image_keys,
-        lang_tokens,
-        lang_masks,
-        state: torch.Tensor | None = None,
-        state_mask: torch.Tensor | None = None,
-    ):
-        """Build the (latent-head, action-head) observation prefixes.
-
-        Cameras are embedded once; the latent prefix omits any action-only camera so
-        the latent stage and its VLM pass never depend on it.
-        """
-        image_cache = self.embed_all_images(images, img_masks, image_keys)
-        latent_keys, action_keys = self._resolve_head_cameras(image_keys)
-        latent_prefix = self.build_prefix(
-            image_cache, latent_keys, lang_tokens, lang_masks, state=state, state_mask=state_mask
-        )
-        action_prefix = self.build_prefix(
-            image_cache, action_keys, lang_tokens, lang_masks, state=state, state_mask=state_mask
-        )
-        return latent_prefix, action_prefix
-
-    def embed_prefix(
-        self,
-        images,
-        img_masks,
-        lang_tokens,
-        lang_masks,
-        state: torch.Tensor | None = None,
-        state_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Backward-compatible all-cameras prefix (external callers / deploy)."""
-        image_keys = list(range(len(images)))
-        image_cache = self.embed_all_images(images, img_masks, image_keys)
-        return self.build_prefix(
-            image_cache, image_keys, lang_tokens, lang_masks, state=state, state_mask=state_mask
-        )
+        return embs, pad_masks, att_masks.expand(pad_masks.shape[0], -1)
 
     def embed_latent_suffix(
         self,
@@ -711,7 +620,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         (
             (latent_obs_embs, latent_obs_pad_masks, latent_obs_att_masks),
             (action_obs_embs, action_obs_pad_masks, action_obs_att_masks),
-        ) = self._embed_head_prefixes(
+        ) = self._head_prefixes(
             images, img_masks, image_keys, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
 
@@ -818,7 +727,7 @@ class LatentSmolVLAFlowMatching(nn.Module):
         (
             (latent_obs_embs, latent_obs_pad_masks, latent_obs_att_masks),
             (action_obs_embs, action_obs_pad_masks, action_obs_att_masks),
-        ) = self._embed_head_prefixes(
+        ) = self._head_prefixes(
             images, img_masks, image_keys, lang_tokens, lang_masks, state=state, state_mask=state_mask
         )
 
@@ -1012,71 +921,44 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
     def _check_get_actions_condition(self) -> bool:
         return len(self._queues[ACTION]) == 0
 
-    def _camera_keys(self):
-        """Resolve (all, latent-head, action-head, needed-union) camera key lists.
-
-        ``latent_camera_keys`` / ``action_camera_keys`` default (None) to all cameras.
-        The needed union is what gets loaded; anything in image_features but in neither
-        head's list is simply not loaded.
-        """
+    def _routed_camera_keys(self):
+        """Cameras to load: the union of the two heads' lists (each None = all cameras)."""
         all_keys = list(self.config.image_features.keys())
-        all_set = set(all_keys)
-        latent = self.config.latent_camera_keys
-        action = self.config.action_camera_keys
-        latent = list(latent) if latent is not None else list(all_keys)
-        action = list(action) if action is not None else list(all_keys)
+        latent = self.config.latent_camera_keys or all_keys
+        action = self.config.action_camera_keys or all_keys
         for name, keys in (("latent_camera_keys", latent), ("action_camera_keys", action)):
-            missing = [key for key in keys if key not in all_set]
-            if missing:
-                raise ValueError(
-                    f"{name} references cameras absent from image_features: {missing}. "
-                    f"Available: {all_keys}"
-                )
-        needed = list(dict.fromkeys([*latent, *action]))
-        return all_keys, latent, action, needed
+            unknown = [k for k in keys if k not in all_keys]
+            if unknown:
+                raise ValueError(f"{name} references cameras absent from image_features: {unknown}. Available: {all_keys}")
+        return list(dict.fromkeys([*latent, *action]))
 
     def prepare_images(self, batch):
-        _, _, _, needed = self._camera_keys()
-
-        # Load every needed camera that is present; record a reference shape so absent
-        # cameras (e.g. the extra cam on a no-extra-cam sample) can be zero-filled and
-        # masked out, keeping batch shapes consistent across heterogeneous data.
-        loaded = {}
-        for key in needed:
-            if key not in batch:
-                continue
-            img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
-            if self.config.resize_imgs_with_padding is not None:
-                img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
-            img = img * 2.0 - 1.0
-            if f"{key}_padding_mask" in batch:
-                mask = batch[f"{key}_padding_mask"].bool()
+        # Load the routed cameras in a fixed order; a camera absent from a sample (e.g.
+        # the extra cam on a no-extra-cam episode) is zero-filled and masked out so
+        # mixed batches collate. The data pipeline should still provide a padding mask.
+        keys = self._routed_camera_keys()
+        images, img_masks, reference = [], [], None
+        for key in keys:
+            if key in batch:
+                img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
+                if self.config.resize_imgs_with_padding is not None:
+                    img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
+                img = img * 2.0 - 1.0
+                mask = batch[f"{key}_padding_mask"].bool() if f"{key}_padding_mask" in batch \
+                    else torch.ones(img.shape[0], dtype=torch.bool, device=img.device)
+                reference = img
             else:
-                mask = torch.ones(img.shape[0], dtype=torch.bool, device=img.device)
-            loaded[key] = (img, mask)
-
-        if len(loaded) == 0:
-            raise ValueError(
-                f"None of the needed cameras {needed} are present in the batch. "
-                f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
-            )
-        reference_img, _ = next(iter(loaded.values()))
-
-        images = []
-        img_masks = []
-        image_keys = []
-        for key in needed:
-            if key in loaded:
-                img, mask = loaded[key]
-            else:
-                img = torch.full_like(reference_img, -1.0)
-                mask = torch.zeros(
-                    reference_img.shape[0], dtype=torch.bool, device=reference_img.device
-                )
+                img, mask = None, None
             images.append(img)
             img_masks.append(mask)
-            image_keys.append(key)
-        return images, img_masks, image_keys
+
+        if reference is None:
+            raise ValueError(f"None of the routed cameras {keys} are in the batch (keys: {list(batch)})")
+        for i, img in enumerate(images):
+            if img is None:
+                images[i] = torch.full_like(reference, -1.0)
+                img_masks[i] = torch.zeros(reference.shape[0], dtype=torch.bool, device=reference.device)
+        return images, img_masks, keys
 
     def prepare_state(self, batch):
         if getattr(self.config, "state_conditioning", "always") == "never":
