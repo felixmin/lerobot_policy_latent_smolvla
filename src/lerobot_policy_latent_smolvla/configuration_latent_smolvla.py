@@ -35,6 +35,15 @@ class LatentSmolVLAConfig(PreTrainedConfig):
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
     empty_cameras: int = 0
 
+    # Per-head camera routing. None => that head sees all cameras in image_features
+    # (current behavior). The latent stage (and the shared VLM pass feeding it) only
+    # sees latent_camera_keys; the action stage sees action_camera_keys. An "extra"
+    # camera listed only in action_camera_keys conditions the action expert without
+    # ever entering the latent stage, so the VLM + latent expert can train on data
+    # that lacks that camera while the action expert trains on the subset that has it.
+    latent_camera_keys: list[str] | None = None
+    action_camera_keys: list[str] | None = None
+
     # Aloha compatibility.
     adapt_to_pi_aloha: bool = False
     use_delta_joint_actions_aloha: bool = False
@@ -184,6 +193,15 @@ class LatentSmolVLAConfig(PreTrainedConfig):
                 "latent_delta_indices must be non-empty when provided, "
                 f"got {self.latent_delta_indices}"
             )
+        for _cam_field, _cam_keys in (
+            ("latent_camera_keys", self.latent_camera_keys),
+            ("action_camera_keys", self.action_camera_keys),
+        ):
+            if _cam_keys is not None and len(_cam_keys) == 0:
+                raise ValueError(
+                    f"{_cam_field} must be non-empty when set "
+                    "(use None to mean 'all cameras')"
+                )
         if self.latent_flow_beta_alpha <= 0.0 or self.latent_flow_beta_beta <= 0.0:
             raise ValueError(
                 "latent_flow_beta_alpha and latent_flow_beta_beta must both be > 0"

@@ -616,11 +616,12 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
     model.action_out_proj = nn.Linear(7, 6)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
-    model.embed_prefix = lambda *args, **kwargs: (
+    _prefix = (
         torch.zeros(2, 3, 7),
         torch.ones(2, 3, dtype=torch.bool),
         torch.zeros(2, 3, dtype=torch.bool),
     )
+    model._embed_head_prefixes = lambda *args, **kwargs: (_prefix, _prefix)
     model.embed_latent_suffix = lambda noisy_motion, timestep: (
         torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
@@ -657,6 +658,7 @@ def test_model_forward_returns_unreduced_action_and_latent_losses_shape():
         None,
         None,
         None,
+        None,
         torch.zeros(2, 6),
         actions,
         latent_vectors=latent_vectors,
@@ -683,11 +685,12 @@ def test_model_forward_returns_action_and_latent_shapes():
     model.action_out_proj = nn.Linear(7, 6)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
-    model.embed_prefix = lambda *args, **kwargs: (
+    _prefix = (
         torch.zeros(2, 4, 7),
         torch.ones(2, 4, dtype=torch.bool),
         torch.zeros(2, 4, dtype=torch.bool),
     )
+    model._embed_head_prefixes = lambda *args, **kwargs: (_prefix, _prefix)
     model.embed_latent_suffix = lambda noisy_motion, timestep: (
         torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
@@ -724,6 +727,7 @@ def test_model_forward_returns_action_and_latent_shapes():
         None,
         None,
         None,
+        None,
         torch.zeros(2, 6),
         actions,
         latents,
@@ -752,11 +756,12 @@ def test_model_forward_zero_latent_conditioning_skips_latent_expert_for_action_m
     model.action_out_proj = nn.Linear(7, 6)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
-    model.embed_prefix = lambda *args, **kwargs: (
+    _prefix = (
         torch.zeros(2, 4, 7),
         torch.ones(2, 4, dtype=torch.bool),
         torch.zeros(2, 4, dtype=torch.bool),
     )
+    model._embed_head_prefixes = lambda *args, **kwargs: (_prefix, _prefix)
     model.embed_latent_suffix = lambda *args, **kwargs: pytest.fail("latent suffix should not be embedded")
     model.embed_action_suffix = lambda noisy_motion, timestep: (
         torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
@@ -779,6 +784,7 @@ def test_model_forward_zero_latent_conditioning_skips_latent_expert_for_action_m
 
     actions = torch.randn(2, 4, 6)
     action_losses, latent_losses = model.forward(
+        None,
         None,
         None,
         None,
@@ -814,11 +820,12 @@ def test_model_sample_actions_zero_latent_conditioning_skips_latent_denoising():
     model.prepare_diffusion_noise = lambda noise, batch_size, sequence_length, feature_dim, device, dtype: torch.zeros(
         batch_size, sequence_length, feature_dim, device=device, dtype=dtype
     )
-    model.embed_prefix = lambda *args, **kwargs: (
+    _prefix = (
         torch.zeros(2, 4, 7),
         torch.ones(2, 4, dtype=torch.bool),
         torch.zeros(2, 4, dtype=torch.bool),
     )
+    model._embed_head_prefixes = lambda *args, **kwargs: (_prefix, _prefix)
 
     def embed_latent_plan(latent_plan, latent_valid=None, action_horizon=4):
         assert torch.count_nonzero(latent_plan) == 0
@@ -847,6 +854,7 @@ def test_model_sample_actions_zero_latent_conditioning_skips_latent_denoising():
     actions = model.sample_actions(
         None,
         None,
+        None,
         torch.zeros(2, 5, dtype=torch.long),
         torch.ones(2, 5, dtype=torch.bool),
         torch.zeros(2, 6),
@@ -871,11 +879,12 @@ def test_model_forward_rejects_mismatched_latent_horizon():
     model.action_out_proj = nn.Linear(7, 6)
     model.sample_time = lambda batch_size, device: torch.full((batch_size,), 0.5, device=device)
     model.sample_noise = lambda shape, device: torch.zeros(shape, device=device)
-    model.embed_prefix = lambda *args, **kwargs: (
+    _prefix = (
         torch.zeros(2, 4, 7),
         torch.ones(2, 4, dtype=torch.bool),
         torch.zeros(2, 4, dtype=torch.bool),
     )
+    model._embed_head_prefixes = lambda *args, **kwargs: (_prefix, _prefix)
     model.embed_latent_suffix = lambda noisy_motion, timestep: (
         torch.zeros(noisy_motion.shape[0], noisy_motion.shape[1], 7),
         torch.ones(noisy_motion.shape[0], noisy_motion.shape[1], dtype=torch.bool),
@@ -897,6 +906,7 @@ def test_model_forward_rejects_mismatched_latent_horizon():
 
     with pytest.raises(ValueError, match=r"Expected latent vector tensor with sequence length 4"):
         model.forward(
+            None,
             None,
             None,
             None,
@@ -930,7 +940,11 @@ def test_policy_forward_combines_action_and_latent_losses():
         max_action_dim=6,
     )
     policy._compute_joint_vector_target_metrics = lambda *args, **kwargs: {}
-    policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
+    policy.prepare_images = lambda batch: (
+        [torch.zeros(2, 3, 4, 4)],
+        [torch.ones(2, dtype=torch.bool)],
+        ["observation.images.cam"],
+    )
     policy.prepare_state = lambda batch: torch.zeros(2, 6)
     policy.model = DummyModel()
 
@@ -971,7 +985,11 @@ def test_policy_forward_aligns_action_and_latent_reduction():
         action_supervision_key=None,
         max_action_dim=6,
     )
-    policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
+    policy.prepare_images = lambda batch: (
+        [torch.zeros(2, 3, 4, 4)],
+        [torch.ones(2, dtype=torch.bool)],
+        ["observation.images.cam"],
+    )
     policy.prepare_state = lambda batch: torch.zeros(2, 6)
     policy.model = DummyModel()
 
@@ -1017,7 +1035,11 @@ def test_policy_forward_combines_latent_validity_with_dataset_padding():
         latent_sequence_length=4,
     )
     policy._compute_joint_vector_target_metrics = lambda *args, **kwargs: {}
-    policy.prepare_images = lambda batch: ([torch.zeros(2, 3, 4, 4)], [torch.ones(2, dtype=torch.bool)])
+    policy.prepare_images = lambda batch: (
+        [torch.zeros(2, 3, 4, 4)],
+        [torch.ones(2, dtype=torch.bool)],
+        ["observation.images.cam"],
+    )
     policy.prepare_state = lambda batch: torch.zeros(2, 6)
     policy.model = DummyModel()
 
@@ -1071,3 +1093,92 @@ def test_joint_vector_target_metrics_skip_joint_alignment_for_sparse_latents():
     assert metrics["batch_joint_supervised_samples"] == 1.0
     assert metrics["batch_joint_supervised_tokens"] == 0.0
     assert "joint_action_latent_target_mse" not in metrics
+
+
+def test_config_rejects_empty_camera_keys():
+    with pytest.raises(ValueError, match="latent_camera_keys must be non-empty"):
+        LatentSmolVLAConfig(latent_camera_keys=[])
+    with pytest.raises(ValueError, match="action_camera_keys must be non-empty"):
+        LatentSmolVLAConfig(action_camera_keys=[])
+
+
+def test_extra_cam_routes_to_action_head_only():
+    """The action-only camera must enlarge the action prefix while leaving the latent
+    prefix (and thus the latent stage / its VLM pass) untouched."""
+    hidden = 7
+    tokens_per_cam = 4
+    model = LatentSmolVLAFlowMatching.__new__(LatentSmolVLAFlowMatching)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        latent_camera_keys=["front", "side"],
+        action_camera_keys=["front", "side", "wrist"],
+    )
+    model.add_image_special_tokens = False
+    model.prefix_length = -1
+    model.state_proj = nn.Linear(6, hidden)
+    model._embed_one_image = lambda img: torch.zeros(img.shape[0], tokens_per_cam, hidden)
+    model.latent_vlm_with_expert = SimpleNamespace(
+        embed_language_tokens=lambda toks: torch.zeros(toks.shape[0], toks.shape[1], hidden)
+    )
+
+    keys = ["front", "side", "wrist"]
+    images = [torch.zeros(2, 3, 8, 8) for _ in keys]
+    masks = [torch.ones(2, dtype=torch.bool) for _ in keys]
+    lang_tokens = torch.zeros(2, 5, dtype=torch.long)
+    lang_masks = torch.ones(2, 5, dtype=torch.bool)
+    state = torch.zeros(2, 6)
+
+    latent_keys, action_keys = model._resolve_head_cameras(keys)
+    assert "wrist" not in latent_keys
+    assert "wrist" in action_keys
+
+    (l_embs, l_pad, _), (a_embs, a_pad, _) = model._embed_head_prefixes(
+        images, masks, keys, lang_tokens, lang_masks, state=state
+    )
+    # Action prefix carries exactly one extra camera's worth of tokens.
+    assert a_embs.shape[1] - l_embs.shape[1] == tokens_per_cam
+    assert a_pad.shape[1] - l_pad.shape[1] == tokens_per_cam
+    # 2 base cams * 4 tokens + 5 language + 1 state = 14 latent-prefix tokens.
+    assert l_embs.shape[1] == 2 * tokens_per_cam + 5 + 1
+
+    # The latent prefix is identical whether or not the wrist camera exists at all.
+    cache_no_wrist = model.embed_all_images(images[:2], masks[:2], keys[:2])
+    l2_embs, _, _ = model.build_prefix(cache_no_wrist, latent_keys, lang_tokens, lang_masks, state=state)
+    assert l2_embs.shape[1] == l_embs.shape[1]
+
+
+def test_prepare_images_loads_union_and_zero_fills_missing_action_cam():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        image_features={"front": None, "side": None, "wrist": None},
+        latent_camera_keys=["front", "side"],
+        action_camera_keys=["front", "side", "wrist"],
+        resize_imgs_with_padding=None,
+    )
+    batch = {
+        "front": torch.zeros(2, 3, 4, 4),
+        "side": torch.ones(2, 3, 4, 4),
+        # wrist intentionally absent (a no-extra-cam sample)
+    }
+
+    images, img_masks, image_keys = policy.prepare_images(batch)
+
+    assert image_keys == ["front", "side", "wrist"]
+    # front (zeros) and side (ones) scaled to [-1, 1]; wrist zero-filled and masked out.
+    assert torch.all(images[0] == -1.0)
+    assert torch.all(images[1] == 1.0)
+    assert torch.all(images[2] == -1.0)
+    assert torch.equal(img_masks[0], torch.ones(2, dtype=torch.bool))
+    assert torch.equal(img_masks[2], torch.zeros(2, dtype=torch.bool))
+
+
+def test_prepare_images_rejects_unknown_camera_keys():
+    policy = LatentSmolVLAPolicy.__new__(LatentSmolVLAPolicy)
+    policy.config = SimpleNamespace(
+        image_features={"front": None, "side": None},
+        latent_camera_keys=["front", "side"],
+        action_camera_keys=["front", "side", "wrist"],
+        resize_imgs_with_padding=None,
+    )
+    with pytest.raises(ValueError, match="action_camera_keys references cameras absent"):
+        policy.prepare_images({"front": torch.zeros(2, 3, 4, 4)})
