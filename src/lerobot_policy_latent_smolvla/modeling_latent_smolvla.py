@@ -944,7 +944,10 @@ class LatentSmolVLAPolicy(PreTrainedPolicy):
                 if self.config.resize_imgs_with_padding is not None:
                     img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
                 img = img * 2.0 - 1.0
-                mask = batch[f"{key}_padding_mask"].bool() if f"{key}_padding_mask" in batch \
+                # Padding mask lives under the camera short name (e.g. observation.images.wrist
+                # -> wrist_padding_mask) so it is not classified/normalized as a STATE feature.
+                pm = batch.get(f"{key.rsplit('.', 1)[-1]}_padding_mask", batch.get(f"{key}_padding_mask"))
+                mask = pm.reshape(img.shape[0]).bool() if pm is not None \
                     else torch.ones(img.shape[0], dtype=torch.bool, device=img.device)
                 reference = img
             else:

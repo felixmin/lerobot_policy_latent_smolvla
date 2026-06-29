@@ -112,6 +112,12 @@ def _make_batch_to_transition_with_latent_keys(
         ]
         if key
     }
+    # Per-head camera routing: preserve per-camera padding masks (e.g. a zero-filled
+    # placeholder wrist on episodes that lack it) so prepare_images can mask them out.
+    # The mask lives under the camera short name (wrist_padding_mask), not the full
+    # observation.images.* key, so it is never classified/normalized as a STATE feature.
+    for cam in (config.latent_camera_keys or []) + (config.action_camera_keys or []):
+        preserved_keys.add(f"{cam.rsplit('.', 1)[-1]}_padding_mask")
 
     def _to_transition(batch: dict[str, Any]):
         transition = batch_to_transition(batch)
